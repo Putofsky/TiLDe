@@ -44,8 +44,10 @@ def build_component_dict(
     for field_id, field_df in data.groupby(field_col, sort=False):
         result[field_id] = {}
 
-        for component_id, component_df in field_df.groupby(component_col,
-                                                            sort=False):
+        for component_id, component_df in field_df.groupby(
+                component_col,
+                sort=False,
+            ):
             if reset_index:
                 component_df = component_df.reset_index(drop=True)
 
