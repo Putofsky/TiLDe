@@ -45,9 +45,9 @@ def build_component_dict(
         result[field_id] = {}
 
         for component_id, component_df in field_df.groupby(
-                component_col,
-                sort=False,
-            ):
+                    component_col,
+                    sort=False,
+                ):
             if reset_index:
                 component_df = component_df.reset_index(drop=True)
 
