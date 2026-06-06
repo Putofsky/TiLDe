@@ -1,2 +1,2 @@
-import IdSep
-import Plot
+from . import IdSep
+from . import Plot
