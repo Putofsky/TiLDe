@@ -35,6 +35,10 @@ Matrice de confusion `(seuil = 0.73)`
 | **0** | 🟦 **764** | 🟪 **10** |
 | **1** | 🟪 **80** | 🟨 **1851** |
 
+# An important analysis, feature analysis
+
+To understand the results we  used feature permutation, this show relevancy of each features. 
+
 # References
 
 <a id="1">[1]</a> 
