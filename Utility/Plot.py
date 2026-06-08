@@ -2,55 +2,59 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+import warnings
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from dash import Dash, Input, Output, dcc, html
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 
-DEFAULT_TIMEZONE = "Europe/Paris"
 DEFAULT_FIELD_COL = "source_id"
 DEFAULT_COMPONENT_COL = "lensComponentSourceId"
+DEFAULT_TIMEZONE = "Europe/Paris"
 
 
-def _read_any(
-    data: Any,
-    field_col: str = DEFAULT_FIELD_COL,
-    component_col: str = DEFAULT_COMPONENT_COL,
-) -> pd.DataFrame:
-    """Accept CSV path, pandas DataFrame, or nested dict {source: {component: df}}."""
+# ============================================================
+# DATA LOADING
+# ============================================================
 
+def _read_data(data: Any) -> pd.DataFrame:
+    """
+    Accepts:
+    - CSV path
+    - pandas DataFrame
+    - nested dict {source_id: {lensComponentSourceId: DataFrame}}
+    """
     if isinstance(data, (str, Path)):
-        return pd.read_csv(data)
+        return pd.read_csv(data, low_memory=False)
 
     if isinstance(data, pd.DataFrame):
         return data.copy()
 
     if isinstance(data, dict):
-        parts: list[pd.DataFrame] = []
+        parts = []
 
-        for source_id, components in data.items():
-            if not isinstance(components, dict):
+        for source_id, comps in data.items():
+            if not isinstance(comps, dict):
                 continue
 
-            for component_id, component_df in components.items():
+            for component_id, component_df in comps.items():
                 tmp = pd.DataFrame(component_df).copy()
 
-                if field_col not in tmp.columns:
-                    tmp[field_col] = source_id
-                if component_col not in tmp.columns:
-                    tmp[component_col] = component_id
+                if DEFAULT_FIELD_COL not in tmp.columns:
+                    tmp[DEFAULT_FIELD_COL] = source_id
+
+                if DEFAULT_COMPONENT_COL not in tmp.columns:
+                    tmp[DEFAULT_COMPONENT_COL] = component_id
 
                 parts.append(tmp)
 
         if parts:
             return pd.concat(parts, ignore_index=True)
 
-    raise ValueError(
-        "data must be a CSV path, a pandas DataFrame, or a nested dict "
-        "{source_id: {component_id: DataFrame}}."
-    )
+    raise ValueError("data must be a CSV path, pandas DataFrame, or nested dict")
 
 
 def _guess_time_col(df: pd.DataFrame) -> str:
@@ -60,11 +64,11 @@ def _guess_time_col(df: pd.DataFrame) -> str:
         "JD_TIME",
         "jd",
         "JD",
+        "mjd",
+        "MJD",
         "julian_date",
         "JulianDate",
         "julianDate",
-        "mjd",
-        "MJD",
         "time",
         "Time",
         "timestamp",
@@ -80,330 +84,717 @@ def _guess_time_col(df: pd.DataFrame) -> str:
             return col
 
     for col in df.columns:
-        key = str(col).lower()
-        if "jd" in key or "julian" in key:
+        name = str(col).lower()
+        if "jd" in name or "julian" in name or "time" in name or "date" in name:
             return col
 
-    for col in df.columns:
-        key = str(col).lower()
-        if "time" in key or "date" in key:
-            return col
-
-    raise ValueError(
-        "Could not find a time column. Pass time_col='your_column'. "
-        f"Available columns are: {list(df.columns)}"
-    )
+    raise ValueError(f"No time column found. Columns are: {list(df.columns)}")
 
 
-def _jd_or_datetime_to_local(series: pd.Series, timezone: str) -> pd.Series:
+def _tzinfo(timezone: str):
+    try:
+        return ZoneInfo(timezone)
+    except Exception:
+        return None
+
+
+def _jd_to_local_time(series: pd.Series, timezone: str) -> pd.Series:
     """
-    Convert JD/MJD time to local timezone.
+    Converts JD or MJD to local datetime.
 
-    JD to Unix seconds:
+    JD -> Unix seconds:
         unix_seconds = (JD - 2440587.5) * 86400
 
-    MJD is also handled:
+    MJD is detected around 30000-100000:
         JD = MJD + 2400000.5
     """
-
     numeric = pd.to_numeric(series, errors="coerce")
 
     if numeric.notna().any():
         jd = numeric.copy()
 
-        # MJD values are usually around 50000-70000.
-        # JD values are usually around 2400000+.
+        # MJD usually around 50_000 - 70_000.
+        # JD usually around 2_400_000+.
         mjd_mask = jd.between(30000, 100000)
         jd.loc[mjd_mask] = jd.loc[mjd_mask] + 2400000.5
 
         unix_seconds = (jd - 2440587.5) * 86400.0
         utc_time = pd.to_datetime(unix_seconds, unit="s", utc=True, errors="coerce")
-    else:
-        utc_time = pd.to_datetime(series, utc=True, errors="coerce")
+        return utc_time.dt.tz_convert(timezone)
 
+    utc_time = pd.to_datetime(series, utc=True, errors="coerce")
     return utc_time.dt.tz_convert(timezone)
 
 
-def _numeric_columns(df: pd.DataFrame, exclude: set[str]) -> list[str]:
-    numeric_cols: list[str] = []
-
-    for col in df.columns:
-        if col in exclude:
-            continue
-
-        converted = pd.to_numeric(df[col], errors="coerce")
-        if converted.notna().any():
-            numeric_cols.append(col)
-
-    return numeric_cols
+def _to_list(x: Any) -> list:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, tuple):
+        return list(x)
+    return [x]
 
 
-def prepare_dataframe(
+def _downsample(sub: pd.DataFrame, max_points: int | None) -> pd.DataFrame:
+    if max_points is None:
+        return sub
+
+    if len(sub) <= max_points:
+        return sub
+
+    idx = np.linspace(0, len(sub) - 1, max_points).astype(int)
+    idx = np.unique(idx)
+
+    return sub.iloc[idx].copy()
+
+
+# ============================================================
+# Y MODES
+# ============================================================
+
+def _apply_y_mode(y: np.ndarray, mode: str) -> tuple[np.ndarray, float]:
+    """
+    Returns:
+        transformed_y, y_error_divisor
+
+    Modes:
+    - raw / none
+    - centered
+    - normalized / zscore
+    - minmax
+    - first=0
+    - first=1
+    """
+    mode = str(mode).lower()
+    out = y.astype(float).copy()
+
+    finite = np.isfinite(out)
+
+    if not finite.any():
+        return out, 1.0
+
+    yf = out[finite]
+
+    if mode in ["raw", "none"]:
+        return out, 1.0
+
+    if mode == "centered":
+        out[finite] = yf - np.nanmean(yf)
+        return out, 1.0
+
+    if mode in ["normalized", "normalize", "normalization", "zscore"]:
+        std = np.nanstd(yf)
+        mean = np.nanmean(yf)
+
+        if std > 0:
+            out[finite] = (yf - mean) / std
+            return out, std
+
+        return out, 1.0
+
+    if mode == "minmax":
+        ymin = np.nanmin(yf)
+        ymax = np.nanmax(yf)
+        scale = ymax - ymin
+
+        if scale > 0:
+            out[finite] = (yf - ymin) / scale
+            return out, scale
+
+        return out, 1.0
+
+    if mode == "first=0":
+        out[finite] = yf - yf[0]
+        return out, 1.0
+
+    if mode == "first=1":
+        first = yf[0]
+
+        if first != 0:
+            out[finite] = yf / first
+            return out, abs(first)
+
+        return out, 1.0
+
+    raise ValueError(
+        "y_mode must be one of: "
+        "'raw', 'centered', 'normalized', 'zscore', 'minmax', 'first=0', 'first=1'"
+    )
+
+
+# ============================================================
+# TIME UTILS
+# ============================================================
+
+def _datetime_to_days(x_datetime: pd.Series | np.ndarray) -> np.ndarray:
+    x = pd.to_datetime(x_datetime)
+    return mdates.date2num(x)
+
+
+def _days_to_datetime(x_days: np.ndarray, timezone: str):
+    return mdates.num2date(x_days, tz=_tzinfo(timezone))
+
+
+# ============================================================
+# SMOOTHING
+# ============================================================
+
+def _smooth_curve(
+    x_days: np.ndarray,
+    y: np.ndarray,
+    window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Simple rolling mean smoothing.
+    """
+    if window <= 1 or len(y) < 3:
+        return x_days, y
+
+    order = np.argsort(x_days)
+
+    x_sorted = x_days[order]
+    y_sorted = y[order]
+
+    y_smooth = (
+        pd.Series(y_sorted)
+        .rolling(window=window, center=True, min_periods=1)
+        .mean()
+        .to_numpy()
+    )
+
+    return x_sorted, y_smooth
+
+
+# ============================================================
+# PREPARE DATA
+# ============================================================
+
+def _prepare_filtered_data(
     data: Any,
+    lens_component_ids: list[str | int] | str | int,
     *,
-    field_col: str = DEFAULT_FIELD_COL,
-    component_col: str = DEFAULT_COMPONENT_COL,
-    time_col: str | None = None,
-    timezone: str = DEFAULT_TIMEZONE,
+    source_id: str | int | None,
+    y_col: str,
+    yerr_col: str,
+    time_col: str | None,
+    source_col: str,
+    component_col: str,
+    timezone: str,
 ) -> tuple[pd.DataFrame, str, list[str]]:
-    df = _read_any(data, field_col=field_col, component_col=component_col)
-
-    if field_col not in df.columns:
-        raise ValueError(f"Missing field column {field_col!r}. Columns: {list(df.columns)}")
+    df = _read_data(data)
 
     if component_col not in df.columns:
-        raise ValueError(f"Missing component column {component_col!r}. Columns: {list(df.columns)}")
+        raise ValueError(f"Missing component_col={component_col!r}. Columns: {list(df.columns)}")
+
+    if source_id is not None and source_col not in df.columns:
+        raise ValueError(f"Missing source_col={source_col!r}. Columns: {list(df.columns)}")
+
+    if y_col not in df.columns:
+        raise ValueError(f"Missing y_col={y_col!r}. Columns: {list(df.columns)}")
 
     if time_col is None:
         time_col = _guess_time_col(df)
 
     if time_col not in df.columns:
-        raise ValueError(f"Missing time column {time_col!r}. Columns: {list(df.columns)}")
+        raise ValueError(f"Missing time_col={time_col!r}. Columns: {list(df.columns)}")
+
+    component_ids = [str(x) for x in _to_list(lens_component_ids)]
+
+    if len(component_ids) not in [1, 2]:
+        raise ValueError("Give exactly 1 or 2 lensComponentSourceId.")
 
     df = df.copy()
 
-    # Convert JD/MJD/UTC datetime to our local time.
-    df["_time_local"] = _jd_or_datetime_to_local(df[time_col], timezone)
-
-    # Dash dropdowns work best with strings.
-    df["_source_key"] = df[field_col].astype(str)
     df["_component_key"] = df[component_col].astype(str)
+    df["_time_local"] = _jd_to_local_time(df[time_col], timezone)
+    df["_y_raw"] = pd.to_numeric(df[y_col], errors="coerce")
 
-    # Drop bad times, then sort by source/component/time.
-    df = df.dropna(subset=["_time_local"])
-    df = df.sort_values([field_col, component_col, "_time_local"]).reset_index(drop=True)
+    if yerr_col in df.columns:
+        df["_yerr_raw"] = pd.to_numeric(df[yerr_col], errors="coerce")
+    else:
+        df["_yerr_raw"] = np.nan
 
-    exclude = {
-        field_col,
-        component_col,
-        time_col,
-        "_time_local",
-        "_source_key",
-        "_component_key",
-    }
+    df = df[df["_component_key"].isin(component_ids)]
 
-    value_cols = _numeric_columns(df, exclude)
+    if source_id is not None:
+        df = df[df[source_col].astype(str) == str(source_id)]
 
-    if not value_cols:
+    df = df.dropna(subset=["_time_local", "_y_raw"])
+    df = df.sort_values(["_component_key", "_time_local"])
+
+    if df.empty:
         raise ValueError(
-            "No numeric value columns found to plot. "
-            "Your CSV must contain at least one numeric measurement column."
+            "No data after filtering. Check lens_component_ids, source_id, y_col, and time_col."
         )
 
-    return df, time_col, value_cols
+    return df, time_col, component_ids
 
 
-def make_app(
+# ============================================================
+# MAIN PLOT FUNCTION
+# ============================================================
+
+def plot_lens_components_matplotlib(
     data: Any,
+    lens_component_ids: list[str | int] | str | int,
     *,
-    field_col: str = DEFAULT_FIELD_COL,
-    component_col: str = DEFAULT_COMPONENT_COL,
+    source_id: str | int | None = None,
+
+    # Columns
+    y_col: str = "flux_obs",
+    yerr_col: str = "flux_obs_error",
     time_col: str | None = None,
-    value_col: str | None = None,
+    source_col: str = DEFAULT_FIELD_COL,
+    component_col: str = DEFAULT_COMPONENT_COL,
     timezone: str = DEFAULT_TIMEZONE,
-    title: str = "EOLENS Plot",
-) -> Dash:
+
+    # Y mode
+    # "raw", "centered", "normalized", "zscore", "minmax", "first=0", "first=1"
+    y_mode: str = "raw",
+
+    # Display
+    show_points: bool = True,
+    show_smooth: bool = False,
+    show_gp: bool = False,
+    show_errorbars: bool = True,
+
+    # Smooth curve
+    smooth_window: int = 7,
+
+    # Gaussian Process
+    gp_points: int = 400,
+    gp_length_scale_days: float = 180.0,
+    gp_alpha_floor: float = 1e-6,
+
+    # Important:
+    # If GP is too flat, decrease: 0.1 -> 0.05 -> 0.02
+    # If GP is too unstable, increase: 0.05 -> 0.1 -> 0.3
+    # Avoid very tiny values like 0.001.
+    gp_error_scale: float = 0.05,
+
+    gp_show_uncertainty: bool = True,
+    gp_fixed_kernel: bool = True,
+    gp_suppress_warnings: bool = True,
+
+    # Time delay in days
+    time_delay_days: float = 0.0,
+    time_delay_by_component: dict[str, float] | None = None,
+
+    # Per-component Y corrections
+    scale_by_component: dict[str, float] | None = None,
+    offset_by_component: dict[str, float] | None = None,
+
+    # Speed
+    max_points_per_curve: int | None = None,
+
+    # Matplotlib style
+    figsize: tuple[float, float] = (12, 6),
+    title: str | None = None,
+    xlabel: str | None = None,
+    ylabel: str | None = None,
+    marker: str = "o",
+    markersize: float = 4,
+    linewidth: float = 2,
+    alpha_points: float = 0.8,
+    alpha_smooth: float = 0.95,
+    alpha_gp: float = 0.95,
+    uncertainty_alpha: float = 0.18,
+    grid: bool = True,
+    legend: bool = True,
+    date_format: str = "%Y-%m-%d\n%H:%M",
+    rotate_xticks: int = 0,
+
+    # Existing axis
+    ax=None,
+):
     """
-    Notebook use:
+    Matplotlib classical plot for 1 or 2 lensComponentSourceId.
 
-        from Utility import Plot
-
-        app = Plot.make_app(data_path)
-        app.run(debug=True)
-
-    Or inline in newer Dash notebooks:
-
-        app.run(jupyter_mode="inline")
+    Can show:
+    - points
+    - error bars with flux_obs_error
+    - smooth rolling curve
+    - stable Gaussian Process using flux_obs_error
+    - time delay on one curve
     """
 
-    df, resolved_time_col, value_cols = prepare_dataframe(
+    df, resolved_time_col, component_ids = _prepare_filtered_data(
         data,
-        field_col=field_col,
-        component_col=component_col,
+        lens_component_ids,
+        source_id=source_id,
+        y_col=y_col,
+        yerr_col=yerr_col,
         time_col=time_col,
+        source_col=source_col,
+        component_col=component_col,
         timezone=timezone,
     )
 
-    if value_col is None:
-        value_col = value_cols[0]
-    elif value_col not in value_cols:
-        raise ValueError(f"value_col={value_col!r} is not numeric or was not found.")
+    time_delay_by_component = time_delay_by_component or {}
+    scale_by_component = scale_by_component or {}
+    offset_by_component = offset_by_component or {}
 
-    sources = sorted(df["_source_key"].dropna().unique().tolist())
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
 
-    if not sources:
-        raise ValueError("No source values found after cleaning the data.")
+    for component_id in component_ids:
+        sub = df[df["_component_key"] == component_id].copy()
 
-    first_source = sources[0]
+        if sub.empty:
+            print(f"Warning: no data for component {component_id}")
+            continue
 
-    def component_options_for_source(source_key: str) -> list[dict[str, str]]:
-        comps = (
-            df.loc[df["_source_key"] == source_key, "_component_key"]
-            .dropna()
-            .drop_duplicates()
-            .sort_values()
-            .tolist()
-        )
-        return [{"label": comp, "value": comp} for comp in comps]
+        sub = _downsample(sub, max_points_per_curve)
 
-    first_component_options = component_options_for_source(first_source)
-    first_components = [opt["value"] for opt in first_component_options[:2]]
+        delay_days = float(time_delay_by_component.get(component_id, time_delay_days))
+        scale = float(scale_by_component.get(component_id, 1.0))
+        offset = float(offset_by_component.get(component_id, 0.0))
 
-    app = Dash(__name__)
+        x = sub["_time_local"] + pd.to_timedelta(delay_days, unit="D")
 
-    app.layout = html.Div(
-        style={"fontFamily": "Arial, sans-serif", "margin": "20px"},
-        children=[
-            html.H2(title),
+        y_raw = sub["_y_raw"].to_numpy(dtype=float)
+        y, y_error_divisor = _apply_y_mode(y_raw, y_mode)
 
-            html.Div(
-                style={
-                    "display": "grid",
-                    "gridTemplateColumns": "1fr 1fr 1fr",
-                    "gap": "12px",
-                    "marginBottom": "12px",
-                },
-                children=[
-                    html.Div(
-                        [
-                            html.Label("Source"),
-                            dcc.Dropdown(
-                                id="source-dropdown",
-                                options=[{"label": s, "value": s} for s in sources],
-                                value=first_source,
-                                clearable=False,
-                            ),
-                        ]
-                    ),
+        yerr = sub["_yerr_raw"].to_numpy(dtype=float)
+        yerr = yerr / y_error_divisor
 
-                    html.Div(
-                        [
-                            html.Label("Component(s)"),
-                            dcc.Dropdown(
-                                id="component-dropdown",
-                                options=first_component_options,
-                                value=first_components,
-                                multi=True,
-                                clearable=False,
-                            ),
-                        ]
-                    ),
+        y = y * scale + offset
+        yerr = np.abs(yerr * scale)
 
-                    html.Div(
-                        [
-                            html.Label("Y value"),
-                            dcc.Dropdown(
-                                id="value-dropdown",
-                                options=[{"label": c, "value": c} for c in value_cols],
-                                value=value_col,
-                                clearable=False,
-                            ),
-                        ]
-                    ),
-                ],
-            ),
+        label_base = f"component {component_id}"
 
-            html.Div(
-                style={"marginBottom": "12px"},
-                children=[
-                    html.Label("Plot mode"),
-                    dcc.RadioItems(
-                        id="mode-radio",
-                        options=[
-                            {"label": " lines + markers", "value": "lines+markers"},
-                            {"label": " markers", "value": "markers"},
-                            {"label": " lines", "value": "lines"},
-                        ],
-                        value="lines+markers",
-                        inline=True,
-                    ),
-                ],
-            ),
+        if delay_days != 0:
+            label_base += f" | delay={delay_days:g} d"
 
-            dcc.Graph(id="main-graph", style={"height": "700px"}),
+        # ----------------------------------------------------
+        # POINTS
+        # ----------------------------------------------------
+        if show_points:
+            has_error = np.isfinite(yerr).any()
 
-            html.Div(
-                id="info-text",
-                style={"marginTop": "8px", "color": "#555"},
-            ),
-        ],
-    )
-
-    @app.callback(
-        Output("component-dropdown", "options"),
-        Output("component-dropdown", "value"),
-        Input("source-dropdown", "value"),
-    )
-    def update_components(source_key: str):
-        options = component_options_for_source(source_key)
-        selected = [opt["value"] for opt in options[:2]]
-        return options, selected
-
-    @app.callback(
-        Output("main-graph", "figure"),
-        Output("info-text", "children"),
-        Input("source-dropdown", "value"),
-        Input("component-dropdown", "value"),
-        Input("value-dropdown", "value"),
-        Input("mode-radio", "value"),
-    )
-    def update_graph(
-        source_key: str,
-        component_keys: list[str] | None,
-        y_col: str,
-        mode: str,
-    ):
-        if not component_keys:
-            component_keys = []
-
-        plot_df = df[
-            (df["_source_key"] == source_key)
-            & (df["_component_key"].isin(component_keys))
-        ].copy()
-
-        plot_df[y_col] = pd.to_numeric(plot_df[y_col], errors="coerce")
-        plot_df = plot_df.dropna(subset=[y_col]).sort_values("_time_local")
-
-        fig = go.Figure()
-
-        for component_key, sub in plot_df.groupby("_component_key", sort=True):
-            fig.add_trace(
-                go.Scatter(
-                    x=sub["_time_local"],
-                    y=sub[y_col],
-                    mode=mode,
-                    name=str(component_key),
-                    customdata=np.stack(
-                        [sub[resolved_time_col].astype(str)],
-                        axis=-1,
-                    ),
-                    hovertemplate=(
-                        "Local time: %{x}<br>"
-                        f"{resolved_time_col}: "
-                        "%{customdata[0]}<br>"
-                        f"{y_col}: "
-                        "%{y}<extra>%{fullData.name}</extra>"
-                    ),
+            if show_errorbars and has_error:
+                ax.errorbar(
+                    x,
+                    y,
+                    yerr=yerr,
+                    fmt=marker,
+                    markersize=markersize,
+                    alpha=alpha_points,
+                    capsize=2,
+                    elinewidth=0.8,
+                    linewidth=0.8,
+                    label=label_base + " points",
                 )
+            else:
+                ax.plot(
+                    x,
+                    y,
+                    marker,
+                    markersize=markersize,
+                    alpha=alpha_points,
+                    linestyle="None",
+                    label=label_base + " points",
+                )
+
+        # ----------------------------------------------------
+        # SMOOTH CURVE
+        # ----------------------------------------------------
+        if show_smooth:
+            x_days = _datetime_to_days(x)
+
+            x_smooth_days, y_smooth = _smooth_curve(
+                x_days,
+                y,
+                window=smooth_window,
             )
 
-        fig.update_layout(
-            title=f"{y_col} by component for source {source_key}",
-            xaxis_title=f"Local time ({timezone})",
-            yaxis_title=y_col,
-            hovermode="closest",
-            legend_title=component_col,
-            margin={"l": 60, "r": 20, "t": 60, "b": 60},
-        )
+            ax.plot(
+                _days_to_datetime(x_smooth_days, timezone),
+                y_smooth,
+                linewidth=linewidth,
+                alpha=alpha_smooth,
+                label=label_base + f" smooth w={smooth_window}",
+            )
 
-        fig.update_xaxes(type="date")
+        # ----------------------------------------------------
+        # GAUSSIAN PROCESS
+        # ----------------------------------------------------
+        if show_gp:
+            try:
+                from sklearn.gaussian_process import GaussianProcessRegressor
+                from sklearn.gaussian_process.kernels import ConstantKernel, RBF
+                from sklearn.exceptions import ConvergenceWarning
+            except ImportError as exc:
+                raise ImportError(
+                    "Gaussian Process requires scikit-learn. "
+                    "Install with: pip install scikit-learn"
+                ) from exc
 
-        info = (
-            f"Using time column {resolved_time_col!r}. "
-            f"Rows plotted: {len(plot_df)}. "
-            f"Sorted by converted local time in {timezone}."
-        )
+            x_days = _datetime_to_days(x)
 
-        return fig, info
+            finite = np.isfinite(x_days) & np.isfinite(y)
 
-    return app
+            use_yerr_for_gp = show_errorbars and np.isfinite(yerr).any()
+
+            if use_yerr_for_gp:
+                finite = finite & np.isfinite(yerr)
+
+            x_train = x_days[finite]
+            y_train = y[finite]
+
+            if len(x_train) < 3:
+                print(f"Warning: not enough valid points for GP component {component_id}")
+                continue
+
+            # Center X for numerical stability
+            x0 = np.nanmin(x_train)
+            X_train = (x_train - x0).reshape(-1, 1)
+
+            # Center Y for numerical stability
+            y_mean = np.nanmean(y_train)
+            y_train_centered = y_train - y_mean
+
+            # Use flux_obs_error as GP alpha.
+            # gp_error_scale avoids GP becoming too flat because of huge errors.
+            if use_yerr_for_gp:
+                alpha = np.maximum((yerr[finite] * gp_error_scale) ** 2, gp_alpha_floor)
+            else:
+                alpha = gp_alpha_floor
+
+            y_var = np.nanvar(y_train_centered)
+
+            if not np.isfinite(y_var) or y_var <= 0:
+                y_var = 1.0
+
+            if gp_fixed_kernel:
+                # Stable GP: fixed length scale, no optimizer.
+                kernel = ConstantKernel(
+                    y_var,
+                    constant_value_bounds="fixed",
+                ) * RBF(
+                    length_scale=gp_length_scale_days,
+                    length_scale_bounds="fixed",
+                )
+
+                gp = GaussianProcessRegressor(
+                    kernel=kernel,
+                    alpha=alpha,
+                    normalize_y=False,
+                    optimizer=None,
+                    random_state=0,
+                )
+
+            else:
+                # More automatic but less stable.
+                kernel = ConstantKernel(
+                    y_var,
+                    constant_value_bounds=(1e-8, 1e8),
+                ) * RBF(
+                    length_scale=gp_length_scale_days,
+                    length_scale_bounds=(1e-2, 1e5),
+                )
+
+                gp = GaussianProcessRegressor(
+                    kernel=kernel,
+                    alpha=alpha,
+                    normalize_y=False,
+                    n_restarts_optimizer=5,
+                    random_state=0,
+                )
+
+            if gp_suppress_warnings:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", ConvergenceWarning)
+                    gp.fit(X_train, y_train_centered)
+            else:
+                gp.fit(X_train, y_train_centered)
+
+            x_grid_days = np.linspace(
+                np.nanmin(x_train),
+                np.nanmax(x_train),
+                gp_points,
+            )
+
+            X_grid = (x_grid_days - x0).reshape(-1, 1)
+
+            y_gp_centered, y_gp_std = gp.predict(X_grid, return_std=True)
+            y_gp = y_gp_centered + y_mean
+
+            x_grid_dates = _days_to_datetime(x_grid_days, timezone)
+
+            ax.plot(
+                x_grid_dates,
+                y_gp,
+                linewidth=linewidth + 0.8,
+                alpha=alpha_gp,
+                label=label_base + " GP",
+            )
+
+            if gp_show_uncertainty:
+                ax.fill_between(
+                    x_grid_dates,
+                    y_gp - y_gp_std,
+                    y_gp + y_gp_std,
+                    alpha=uncertainty_alpha,
+                    label=label_base + " GP ±1σ",
+                )
+
+    if title is None:
+        title = f"{y_col} vs time | mode={y_mode}"
+
+    if xlabel is None:
+        xlabel = f"Local time ({timezone})"
+
+    if ylabel is None:
+        ylabel = y_col
+        if y_mode not in ["raw", "none"]:
+            ylabel += f" ({y_mode})"
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    if grid:
+        ax.grid(True, alpha=0.3)
+
+    ax.xaxis.set_major_formatter(
+        mdates.DateFormatter(date_format, tz=_tzinfo(timezone))
+    )
+
+    if rotate_xticks:
+        plt.setp(ax.get_xticklabels(), rotation=rotate_xticks, ha="right")
+
+    if legend:
+        ax.legend()
+
+    fig.tight_layout()
+
+    return fig, ax
+
+
+# ============================================================
+# GP CONVENIENCE FUNCTION
+# ============================================================
+
+def plot_lens_components_gp(
+    data: Any,
+    lens_component_ids: list[str | int] | str | int,
+    *,
+    source_id: str | int | None = None,
+
+    y_col: str = "flux_obs",
+    yerr_col: str = "flux_obs_error",
+    time_col: str | None = None,
+    source_col: str = DEFAULT_FIELD_COL,
+    component_col: str = DEFAULT_COMPONENT_COL,
+    timezone: str = DEFAULT_TIMEZONE,
+
+    y_mode: str = "centered",
+
+    time_delay_days: float = 0.0,
+    time_delay_by_component: dict[str, float] | None = None,
+
+    gp_points: int = 500,
+    gp_length_scale_days: float = 180.0,
+    gp_error_scale: float = 0.05,
+    gp_show_uncertainty: bool = True,
+    gp_fixed_kernel: bool = True,
+
+    show_points: bool = True,
+    show_errorbars: bool = True,
+
+    max_points_per_curve: int | None = None,
+
+    figsize: tuple[float, float] = (13, 6),
+    title: str = "Gaussian Process using flux_obs_error",
+):
+    """
+    Shortcut for Gaussian Process plot.
+
+    This uses:
+    - show_gp=True
+    - show_smooth=False
+    - stable fixed-kernel GP by default
+    """
+
+    return plot_lens_components_matplotlib(
+        data,
+        lens_component_ids,
+        source_id=source_id,
+        y_col=y_col,
+        yerr_col=yerr_col,
+        time_col=time_col,
+        source_col=source_col,
+        component_col=component_col,
+        timezone=timezone,
+        y_mode=y_mode,
+        show_points=show_points,
+        show_smooth=False,
+        show_gp=True,
+        show_errorbars=show_errorbars,
+        gp_points=gp_points,
+        gp_length_scale_days=gp_length_scale_days,
+        gp_error_scale=gp_error_scale,
+        gp_show_uncertainty=gp_show_uncertainty,
+        gp_fixed_kernel=gp_fixed_kernel,
+        time_delay_days=time_delay_days,
+        time_delay_by_component=time_delay_by_component,
+        max_points_per_curve=max_points_per_curve,
+        figsize=figsize,
+        title=title,
+    )
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def list_lens_components(
+    data: Any,
+    *,
+    source_id: str | int | None = None,
+    source_col: str = DEFAULT_FIELD_COL,
+    component_col: str = DEFAULT_COMPONENT_COL,
+) -> list[str]:
+    df = _read_data(data)
+
+    if component_col not in df.columns:
+        raise ValueError(f"Missing component_col={component_col!r}. Columns: {list(df.columns)}")
+
+    if source_id is not None:
+        if source_col not in df.columns:
+            raise ValueError(f"Missing source_col={source_col!r}. Columns: {list(df.columns)}")
+
+        df = df[df[source_col].astype(str) == str(source_id)]
+
+    return sorted(df[component_col].astype(str).dropna().unique().tolist())
+
+
+def list_sources(
+    data: Any,
+    *,
+    source_col: str = DEFAULT_FIELD_COL,
+) -> list[str]:
+    df = _read_data(data)
+
+    if source_col not in df.columns:
+        raise ValueError(f"Missing source_col={source_col!r}. Columns: {list(df.columns)}")
+
+    return sorted(df[source_col].astype(str).dropna().unique().tolist())
+
+
+def list_numeric_columns(data: Any) -> list[str]:
+    df = _read_data(data)
+
+    cols = []
+
+    for col in df.columns:
+        test = pd.to_numeric(df[col], errors="coerce")
+
+        if test.notna().any():
+            cols.append(col)
+
+    return cols
