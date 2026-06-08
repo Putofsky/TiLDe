@@ -1,1 +1,2 @@
-# Quasar Detection using Neural Network
+# Quasar Detection using Neural Network QSO-NET
+
