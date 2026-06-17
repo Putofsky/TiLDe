@@ -1,24 +1,57 @@
+"""
+Pretraitement.py
+================
+
+Reusable preprocessing for EOLENS-style light curves.
+
+Main function
+-------------
+    pretraitement(data, ...)
+
+It applies the same methodology used in `PreProcessingTest.ipynb`:
+1. optional first-N source/component selection,
+2. per source/component binning using ((epoch_obs_jd - min_epoch) // bin_days),
+3. adaptive rolling median with hybrid MAD + clipped-L2 scale, excluding the tested point,
+4. SNR source/component filtering inside this module,
+5. local CSV export of the cleaned data and local reports.
+
+No download is triggered by this file. Outputs are saved only to the local paths
+passed through `output_dir`.
+"""
+
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple, List, Dict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 DEFAULT_SOURCE_COL = "source_id"
 DEFAULT_COMPONENT_COL = "lensComponentSourceId"
+DEFAULT_TIME_COL = "epoch_obs_jd"
 DEFAULT_Y_COL = "flux_obs"
 DEFAULT_YERR_COL = "flux_obs_error"
 
 
-# ============================================================
-# BASIC UTILS
-# ============================================================
+@dataclass
+class PretraitementResult:
+    """Container returned by `pretraitement`."""
+
+    clean_df: pd.DataFrame
+    source_report: pd.DataFrame
+    removed_points_df: pd.DataFrame
+    summary: Dict[str, Any]
+    clean_csv_path: Path
+    report_csv_path: Path
+    removed_points_csv_path: Path
+    summary_txt_path: Path
+
 
 def read_lightcurve_data(data: Any) -> pd.DataFrame:
+    """Read a CSV path, copy a DataFrame, or flatten a nested dict."""
     if isinstance(data, (str, Path)):
         return pd.read_csv(data, low_memory=False)
 
@@ -26,23 +59,17 @@ def read_lightcurve_data(data: Any) -> pd.DataFrame:
         return data.copy()
 
     if isinstance(data, dict):
-        parts = []
-
+        parts: List[pd.DataFrame] = []
         for source_id, comps in data.items():
             if not isinstance(comps, dict):
                 continue
-
             for component_id, component_df in comps.items():
                 tmp = pd.DataFrame(component_df).copy()
-
                 if DEFAULT_SOURCE_COL not in tmp.columns:
                     tmp[DEFAULT_SOURCE_COL] = source_id
-
                 if DEFAULT_COMPONENT_COL not in tmp.columns:
                     tmp[DEFAULT_COMPONENT_COL] = component_id
-
                 parts.append(tmp)
-
         if parts:
             return pd.concat(parts, ignore_index=True)
 
@@ -50,190 +77,94 @@ def read_lightcurve_data(data: Any) -> pd.DataFrame:
 
 
 def guess_time_col(df: pd.DataFrame) -> str:
+    """Guess the time column, with `epoch_obs_jd` preferred."""
     candidates = [
-        "epoch_obs_jd",
-        "jd_time",
-        "jdTime",
-        "JD_TIME",
-        "jd",
-        "JD",
-        "mjd",
-        "MJD",
-        "julian_date",
-        "JulianDate",
-        "julianDate",
-        "time",
-        "Time",
-        "timestamp",
-        "Timestamp",
-        "datetime",
-        "Datetime",
-        "date",
-        "Date",
+        DEFAULT_TIME_COL,
+        "jd_time", "jdTime", "JD_TIME", "jd", "JD",
+        "mjd", "MJD", "julian_date", "JulianDate", "julianDate",
+        "time", "Time", "timestamp", "Timestamp", "datetime", "Datetime",
+        "date", "Date",
     ]
-
     for col in candidates:
         if col in df.columns:
             return col
 
     for col in df.columns:
         name = str(col).lower()
-        if "jd" in name or "julian" in name or "time" in name or "date" in name or "epoch" in name:
+        if any(token in name for token in ["jd", "julian", "time", "date", "epoch"]):
             return col
 
-    raise ValueError(f"No time column found. Columns are: {list(df.columns)}")
-
-
-def _time_to_days(series: pd.Series) -> np.ndarray:
-    numeric = pd.to_numeric(series, errors="coerce")
-
-    if numeric.notna().sum() >= max(3, int(0.5 * len(series))):
-        return numeric.to_numpy(dtype=float)
-
-    dt = pd.to_datetime(series, utc=True, errors="coerce")
-    arr = dt.astype("int64").to_numpy(dtype=float)
-
-    nat_value = np.iinfo("int64").min
-    arr[arr == nat_value] = np.nan
-
-    return arr / 1e9 / 86400.0
-
-
-def _days_to_output_time(days: np.ndarray, original_series: pd.Series):
-    numeric = pd.to_numeric(original_series, errors="coerce")
-
-    if numeric.notna().sum() >= max(3, int(0.5 * len(original_series))):
-        return days
-
-    return pd.to_datetime(days * 86400.0, unit="s", utc=True)
+    raise ValueError(f"No time column found. Available columns: {list(df.columns)}")
 
 
 def _safe_group_cols(
     df: pd.DataFrame,
-    source_col: str,
-    component_col: Optional[str],
+    source_col: str = DEFAULT_SOURCE_COL,
+    component_col: Optional[str] = DEFAULT_COMPONENT_COL,
 ) -> List[str]:
-    cols = []
-
-    if source_col in df.columns:
+    cols: List[str] = []
+    if source_col and source_col in df.columns:
         cols.append(source_col)
-
-    if component_col is not None and component_col in df.columns:
+    if component_col and component_col in df.columns:
         cols.append(component_col)
-
     if not cols:
         raise ValueError(
-            f"No valid group columns found. Tried source_col={source_col!r}, "
+            f"No group columns found. Tried source_col={source_col!r}, "
             f"component_col={component_col!r}."
         )
-
     return cols
 
 
-def _get_group_title(keys: Any, group_cols: List[str]) -> str:
+def _group_title(keys: Any, group_cols: List[str]) -> str:
     if not isinstance(keys, tuple):
         keys = (keys,)
-
     return ", ".join(f"{col}={val}" for col, val in zip(group_cols, keys))
 
-
-def _robust_sigma(values: np.ndarray) -> float:
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-
-    if len(values) < 3:
-        return np.nan
-
-    med = np.nanmedian(values)
-    mad = np.nanmedian(np.abs(values - med))
-    sigma = 1.4826 * mad
-
-    if not np.isfinite(sigma) or sigma <= 0:
-        sigma = np.nanstd(values)
-
-    return float(sigma)
-
-
-def _safe_yerr(yerr: np.ndarray) -> np.ndarray:
-    yerr = np.asarray(yerr, dtype=float)
-
-    good = np.isfinite(yerr) & (yerr > 0)
-
-    if good.any():
-        fallback = np.nanmedian(yerr[good])
-    else:
-        fallback = 1.0
-
-    return np.where(good, yerr, fallback)
-
-
-# ============================================================
-# FIRST X SOURCES
-# ============================================================
 
 def limit_first_sources(
     df: pd.DataFrame,
     *,
     group_cols: List[str],
-    max_sources: Optional[int] = 2000,
+    max_sources: Optional[int] = None,
     source_selection: str = "first",
     random_state: int = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-
+    """Keep all groups, the first N groups, or a random N groups."""
     unique_groups = df[group_cols].drop_duplicates().reset_index(drop=True)
     unique_groups["_source_rank"] = np.arange(len(unique_groups))
-
     total_sources = len(unique_groups)
 
     if max_sources is None:
-        selected_groups = unique_groups.copy()
-
+        selected = unique_groups.copy()
     else:
         max_sources = int(max_sources)
-
         if max_sources <= 0:
-            raise ValueError("max_sources must be positive or None.")
-
+            raise ValueError("max_sources must be positive or None")
         if source_selection == "first":
-            selected_groups = unique_groups.head(max_sources).copy()
-
+            selected = unique_groups.head(max_sources).copy()
         elif source_selection == "random":
-            selected_groups = (
+            selected = (
                 unique_groups
-                .sample(
-                    n=min(max_sources, total_sources),
-                    random_state=random_state,
-                )
+                .sample(n=min(max_sources, total_sources), random_state=random_state)
                 .sort_values("_source_rank")
                 .copy()
             )
-
         else:
-            raise ValueError("source_selection must be 'first' or 'random'.")
+            raise ValueError("source_selection must be 'first' or 'random'")
 
-    limited = df.merge(
-        selected_groups[group_cols + ["_source_rank"]],
-        on=group_cols,
-        how="inner",
-    )
-
-    limited = limited.sort_values("_source_rank").reset_index(drop=True)
+    out = df.merge(selected[group_cols + ["_source_rank"]], on=group_cols, how="inner")
+    out = out.sort_values("_source_rank").reset_index(drop=True)
 
     info = pd.DataFrame({
-        "total_sources_available": [total_sources],
-        "selected_sources": [len(selected_groups)],
+        "total_source_component_groups_available": [total_sources],
+        "selected_source_component_groups": [len(selected)],
         "max_sources": [max_sources],
         "source_selection": [source_selection],
     })
+    return out, info
 
-    return limited, info
 
-
-# ============================================================
-# BI-DAILY AGGREGATION
-# ============================================================
-
-def aggregate_bi_daily(
+def aggregate_by_notebook_bins(
     data: Any,
     *,
     time_col: Optional[str] = None,
@@ -241,123 +172,178 @@ def aggregate_bi_daily(
     yerr_col: str = DEFAULT_YERR_COL,
     source_col: str = DEFAULT_SOURCE_COL,
     component_col: Optional[str] = DEFAULT_COMPONENT_COL,
-    bin_days: float = 2.0,
+    bin_days: float = 4.0,
     error_mode: str = "mean",
     keep_other_cols: bool = True,
 ) -> pd.DataFrame:
+    """
+    Aggregate each source/component using the notebook bin formula.
 
+    In the notebook, for each component:
+        bin = ((epoch_obs_jd - epoch_obs_jd.min()) // 4).astype(int)
+    """
     df = read_lightcurve_data(data)
-
     if time_col is None:
         time_col = guess_time_col(df)
 
     group_cols = _safe_group_cols(df, source_col, component_col)
-
-    required = group_cols + [time_col, y_col]
-
-    if yerr_col in df.columns:
-        required.append(yerr_col)
-
-    missing = [c for c in required if c not in df.columns]
-
+    missing = [c for c in group_cols + [time_col, y_col] if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns: {missing}. Available columns: {list(df.columns)}")
 
-    data_df = df.copy()
-    data_df["_time_days"] = _time_to_days(data_df[time_col])
-    data_df[y_col] = pd.to_numeric(data_df[y_col], errors="coerce")
-
-    if yerr_col in data_df.columns:
-        data_df[yerr_col] = pd.to_numeric(data_df[yerr_col], errors="coerce")
+    d = df.copy()
+    d[time_col] = pd.to_numeric(d[time_col], errors="coerce")
+    d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+    if yerr_col in d.columns:
+        d[yerr_col] = pd.to_numeric(d[yerr_col], errors="coerce")
     else:
-        data_df[yerr_col] = np.nan
+        d[yerr_col] = np.nan
 
-    data_df = data_df.dropna(subset=["_time_days", y_col])
-    data_df = data_df.sort_values(group_cols + ["_time_days"])
+    d = d.dropna(subset=[time_col, y_col]).sort_values(group_cols + [time_col])
+    if d.empty:
+        raise ValueError("No valid rows remain after converting time/flux columns")
 
-    if data_df.empty:
-        raise ValueError("No valid data after converting time and flux columns.")
+    rows: List[Dict[str, Any]] = []
 
-    origin = np.nanmin(data_df["_time_days"].to_numpy(dtype=float))
-    data_df["_bin_index"] = np.floor((data_df["_time_days"] - origin) / bin_days).astype(int)
+    for _, sub in d.groupby(group_cols, sort=False):
+        sub = sub.sort_values(time_col).copy()
+        group_min = float(sub[time_col].min())
+        sub["_pre_bin_index"] = np.floor((sub[time_col] - group_min) / float(bin_days)).astype(int)
 
-    rows = []
+        for bin_index, b in sub.groupby("_pre_bin_index", sort=False):
+            row: Dict[str, Any] = {}
+            for col in group_cols:
+                row[col] = b[col].iloc[0]
+            if "_source_rank" in b.columns:
+                row["_source_rank"] = b["_source_rank"].iloc[0]
 
-    for keys, sub in data_df.groupby(group_cols + ["_bin_index"], sort=False):
-        if not isinstance(keys, tuple):
-            keys = (keys,)
+            row[time_col] = float(b[time_col].mean())
+            row[y_col] = float(b[y_col].mean())
 
-        key_values = dict(zip(group_cols + ["_bin_index"], keys))
+            good_err = b[yerr_col].to_numpy(dtype=float)
+            good_err = good_err[np.isfinite(good_err) & (good_err > 0)]
 
-        y = sub[y_col].to_numpy(dtype=float)
-        err = sub[yerr_col].to_numpy(dtype=float)
-        finite_err = np.isfinite(err)
-
-        if error_mode == "mean":
-            new_err = float(np.nanmean(err)) if finite_err.any() else np.nan
-
-        elif error_mode == "quadrature":
-            if finite_err.any():
-                new_err = float(np.sqrt(np.nansum(err[finite_err] ** 2)) / finite_err.sum())
+            if error_mode == "mean":
+                row[yerr_col] = float(np.nanmean(good_err)) if len(good_err) else np.nan
+            elif error_mode == "quadrature":
+                row[yerr_col] = float(np.sqrt(np.nansum(good_err ** 2)) / len(good_err)) if len(good_err) else np.nan
+            elif error_mode == "sem":
+                y = b[y_col].to_numpy(dtype=float)
+                row[yerr_col] = (
+                    float(np.nanstd(y, ddof=1) / np.sqrt(np.isfinite(y).sum()))
+                    if len(y) > 1
+                    else (float(good_err[0]) if len(good_err) else np.nan)
+                )
             else:
-                new_err = np.nan
+                raise ValueError("error_mode must be 'mean', 'quadrature', or 'sem'")
 
-        elif error_mode == "sem":
-            if len(y) > 1:
-                new_err = float(np.nanstd(y, ddof=1) / np.sqrt(np.isfinite(y).sum()))
-            else:
-                new_err = float(err[finite_err][0]) if finite_err.any() else np.nan
+            row["n_points_in_bin"] = int(len(b))
+            row["pre_bin_index"] = int(bin_index)
+            row["pre_bin_start_day"] = float(group_min + int(bin_index) * float(bin_days))
+            row["pre_bin_end_day"] = float(group_min + (int(bin_index) + 1) * float(bin_days))
 
-        else:
-            raise ValueError("error_mode must be 'mean', 'quadrature', or 'sem'.")
+            if keep_other_cols:
+                for col in b.columns:
+                    if col.startswith("_") or col in row or col in [time_col, y_col, yerr_col]:
+                        continue
+                    vals = b[col].dropna().unique()
+                    if len(vals) == 1:
+                        row[col] = vals[0]
 
-        row = {}
-
-        for col in group_cols:
-            row[col] = sub[col].iloc[0]
-
-        if "_source_rank" in sub.columns:
-            row["_source_rank"] = sub["_source_rank"].iloc[0]
-
-        mean_time_days = float(np.nanmean(sub["_time_days"]))
-
-        row[time_col] = _days_to_output_time(
-            np.array([mean_time_days]),
-            df[time_col],
-        )[0]
-
-        row[y_col] = float(np.nanmean(y))
-        row[yerr_col] = new_err
-        row["n_points_in_bin"] = int(len(sub))
-        row["pre_bin_index"] = int(key_values["_bin_index"])
-        row["pre_bin_start_day"] = float(origin + key_values["_bin_index"] * bin_days)
-        row["pre_bin_end_day"] = float(origin + (key_values["_bin_index"] + 1) * bin_days)
-
-        if keep_other_cols:
-            for col in sub.columns:
-                if col.startswith("_"):
-                    continue
-                if col in row:
-                    continue
-                if col in [time_col, y_col, yerr_col]:
-                    continue
-
-                vals = sub[col].dropna().unique()
-
-                if len(vals) == 1:
-                    row[col] = vals[0]
-
-        rows.append(row)
+            rows.append(row)
 
     out = pd.DataFrame(rows)
-    out = out.sort_values(group_cols + [time_col]).reset_index(drop=True)
-
-    return out
+    return out.sort_values(group_cols + [time_col]).reset_index(drop=True)
 
 
-# ============================================================
-# SNR
-# ============================================================
+def robust_hybrid_scale(values: Iterable[float], *, alpha: float = 0.7, c: float = 2.5) -> Tuple[float, float]:
+    """
+    Same robust scale used in the notebook.
+
+    sigma = alpha * MAD_sigma + (1 - alpha) * clipped_L2_sigma
+    """
+    v = np.asarray(list(values), dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) == 0:
+        return np.nan, np.nan
+
+    med = float(np.nanmedian(v))
+    residuals = v - med
+    mad = float(np.nanmedian(np.abs(residuals)))
+    sigma_mad = 1.4826 * mad
+
+    if not np.isfinite(sigma_mad) or sigma_mad <= 0:
+        return med, 0.0
+
+    clipped = np.clip(residuals, -float(c) * sigma_mad, float(c) * sigma_mad)
+    sigma_l2_clip = float(np.sqrt(np.nanmean(clipped ** 2)))
+    sigma = float(float(alpha) * sigma_mad + (1.0 - float(alpha)) * sigma_l2_clip)
+    return med, sigma
+
+
+def adaptive_rolling_hybrid_scores(
+    sub: pd.DataFrame,
+    *,
+    y_col: str = DEFAULT_Y_COL,
+    time_col: str = DEFAULT_TIME_COL,
+    half_window: int = 5,
+    alpha: float = 0.7,
+    c: float = 2.5,
+    exclude_center: bool = True,
+) -> pd.DataFrame:
+    """Return rolling median, hybrid sigma, bands, and local score for one group."""
+    if len(sub) == 0:
+        return sub.copy()
+
+    d = sub.copy()
+    d[time_col] = pd.to_numeric(d[time_col], errors="coerce")
+    d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+    d = d.sort_values(time_col).reset_index(drop=False).rename(columns={"index": "_original_index"})
+
+    n = len(d)
+    half_window = int(half_window)
+    if half_window < 1:
+        raise ValueError("half_window must be >= 1")
+
+    window = 2 * half_window + 1
+    rolling_median: List[float] = []
+    rolling_sigma: List[float] = []
+    n_neighbors: List[int] = []
+
+    for i in range(n):
+        if i < half_window:
+            idx = np.arange(0, min(window, n))
+        elif i >= n - half_window:
+            idx = np.arange(max(0, n - window), n)
+        else:
+            idx = np.arange(i - half_window, i + half_window + 1)
+
+        if exclude_center:
+            idx = idx[idx != i]
+
+        values = d[y_col].iloc[idx].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        med, sigma = robust_hybrid_scale(values, alpha=alpha, c=c)
+
+        rolling_median.append(med)
+        rolling_sigma.append(sigma)
+        n_neighbors.append(int(len(values)))
+
+    d["pre_rolling_median"] = rolling_median
+    d["pre_rolling_sigma_hybrid"] = rolling_sigma
+    d["pre_n_neighbors_used"] = n_neighbors
+
+    denom = d["pre_rolling_sigma_hybrid"].to_numpy(dtype=float)
+    resid = d[y_col].to_numpy(dtype=float) - d["pre_rolling_median"].to_numpy(dtype=float)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = resid / denom
+
+    z[~np.isfinite(denom) | (denom <= 0)] = np.nan
+    d["pre_local_z"] = z
+
+    return d
+
 
 def compute_snr_metrics(
     sub: pd.DataFrame,
@@ -366,15 +352,22 @@ def compute_snr_metrics(
     yerr_col: str = DEFAULT_YERR_COL,
     signal_mode: str = "amplitude",
 ) -> Dict[str, Any]:
+    """
+    Compute source/component SNR.
 
+    Default signal is the robust amplitude:
+        0.5 * (P95(flux) - P5(flux))
+
+    Noise is median positive `flux_obs_error`.
+    """
     y = pd.to_numeric(sub[y_col], errors="coerce").to_numpy(dtype=float)
+    y = y[np.isfinite(y)]
 
     if yerr_col in sub.columns:
         yerr = pd.to_numeric(sub[yerr_col], errors="coerce").to_numpy(dtype=float)
     else:
-        yerr = np.full_like(y, np.nan)
+        yerr = np.full(len(sub), np.nan)
 
-    y = y[np.isfinite(y)]
     yerr = yerr[np.isfinite(yerr) & (yerr > 0)]
 
     if len(y) < 3:
@@ -398,771 +391,153 @@ def compute_snr_metrics(
     if signal_mode == "amplitude":
         q05, q95 = np.nanpercentile(y, [5, 95])
         signal = 0.5 * (q95 - q05)
-
     elif signal_mode == "std":
         signal = np.nanstd(y)
-
     elif signal_mode == "robust_std":
-        signal = _robust_sigma(y)
-
+        med = np.nanmedian(y)
+        signal = 1.4826 * np.nanmedian(np.abs(y - med))
     else:
-        raise ValueError("signal_mode must be 'amplitude', 'std', or 'robust_std'.")
+        raise ValueError("signal_mode must be 'amplitude', 'std', or 'robust_std'")
 
     noise = np.nanmedian(yerr)
 
     if not np.isfinite(signal) or signal <= 0:
-        snr = np.nan
-        nsr = np.inf
-        reason = "invalid_or_zero_signal"
-
-    elif not np.isfinite(noise) or noise <= 0:
-        snr = np.nan
-        nsr = np.nan
-        reason = "invalid_or_zero_noise"
-
-    else:
-        snr = signal / noise
-        nsr = noise / signal
-        reason = "ok"
-
-    return {
-        "signal": float(signal) if np.isfinite(signal) else signal,
-        "noise": float(noise) if np.isfinite(noise) else noise,
-        "snr": float(snr) if np.isfinite(snr) else snr,
-        "noise_signal_ratio": float(nsr) if np.isfinite(nsr) else nsr,
-        "snr_reason": reason,
-    }
-
-
-# ============================================================
-# KALMAN SMOOTHER
-# ============================================================
-
-def _estimate_process_var(
-    t: np.ndarray,
-    y: np.ndarray,
-    yerr: np.ndarray,
-    q_scale: float = 0.30,
-) -> float:
-    """
-    Automatic process variance for constant-velocity Kalman model.
-
-    Higher q_scale:
-        follows faster variations.
-
-    Lower q_scale:
-        smoother model.
-    """
-    t = np.asarray(t, dtype=float)
-    y = np.asarray(y, dtype=float)
-    yerr = np.asarray(yerr, dtype=float)
-
-    dt = np.diff(np.sort(t))
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-
-    if len(dt) == 0:
-        median_dt = 1.0
-    else:
-        median_dt = float(np.nanmedian(dt))
-
-    y_sigma = _robust_sigma(y)
-
-    if not np.isfinite(y_sigma) or y_sigma <= 0:
-        y_sigma = np.nanstd(y)
-
-    if not np.isfinite(y_sigma) or y_sigma <= 0:
-        y_sigma = np.nanmedian(yerr)
-
-    if not np.isfinite(y_sigma) or y_sigma <= 0:
-        y_sigma = 1.0
-
-    median_dt = max(median_dt, 1e-6)
-
-    # Want typical process position std over median_dt to be q_scale * y_sigma.
-    q = 3.0 * (q_scale * y_sigma) ** 2 / (median_dt ** 3)
-
-    return float(max(q, 1e-12))
-
-
-def kalman_smoother_constant_velocity(
-    t: np.ndarray,
-    y: np.ndarray,
-    yerr: np.ndarray,
-    *,
-    process_var: Optional[float] = None,
-    process_var_scale: float = 0.30,
-    model_floor: Optional[float] = None,
-) -> Dict[str, Any]:
-    """
-    Irregular-time Kalman filter + RTS smoother.
-
-    State:
-        x = [level, slope]
-
-    Observation:
-        y = level + noise
-
-    This model is flexible enough for light curves but more stable than
-    polynomial/DRW/Perona-Malik for preprocessing.
-    """
-    t = np.asarray(t, dtype=float)
-    y = np.asarray(y, dtype=float)
-    yerr = _safe_yerr(np.asarray(yerr, dtype=float))
-
-    good = np.isfinite(t) & np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
-
-    if good.sum() < 4:
-        raise ValueError("Not enough valid points for Kalman smoother.")
-
-    original_positions = np.arange(len(t))[good]
-
-    t_good = t[good]
-    y_good = y[good]
-    yerr_good = yerr[good]
-
-    order = np.argsort(t_good)
-
-    t_sorted = t_good[order]
-    y_sorted = y_good[order]
-    yerr_sorted = yerr_good[order]
-    original_sorted_positions = original_positions[order]
-
-    n = len(y_sorted)
-
-    if process_var is None:
-        q = _estimate_process_var(
-            t_sorted,
-            y_sorted,
-            yerr_sorted,
-            q_scale=process_var_scale,
-        )
-    else:
-        q = float(process_var)
-
-    q = max(q, 1e-12)
-
-    if model_floor is None:
-        model_floor_use = 0.5 * float(np.nanmedian(yerr_sorted))
-    else:
-        model_floor_use = float(model_floor)
-
-    model_floor_use = max(model_floor_use, 1e-12)
-
-    R = yerr_sorted ** 2 + model_floor_use ** 2
-
-    H = np.array([[1.0, 0.0]])
-
-    x_filt = np.zeros((n, 2), dtype=float)
-    P_filt = np.zeros((n, 2, 2), dtype=float)
-    x_pred = np.zeros((n, 2), dtype=float)
-    P_pred = np.zeros((n, 2, 2), dtype=float)
-    F_list = np.zeros((n, 2, 2), dtype=float)
-
-    y_med = float(np.nanmedian(y_sorted))
-    y_sig = _robust_sigma(y_sorted)
-
-    if not np.isfinite(y_sig) or y_sig <= 0:
-        y_sig = np.nanstd(y_sorted)
-
-    if not np.isfinite(y_sig) or y_sig <= 0:
-        y_sig = max(float(np.nanmedian(yerr_sorted)), 1.0)
-
-    dt_all = np.diff(t_sorted)
-    dt_good = dt_all[np.isfinite(dt_all) & (dt_all > 0)]
-    median_dt = float(np.nanmedian(dt_good)) if len(dt_good) > 0 else 1.0
-    median_dt = max(median_dt, 1e-6)
-
-    x_prev = np.array([y_med, 0.0], dtype=float)
-    P_prev = np.array([
-        [100.0 * y_sig ** 2, 0.0],
-        [0.0, 100.0 * y_sig ** 2 / median_dt ** 2],
-    ])
-
-    for k in range(n):
-        if k == 0:
-            F = np.eye(2)
-            Q = np.zeros((2, 2), dtype=float)
-        else:
-            dt = float(t_sorted[k] - t_sorted[k - 1])
-            dt = max(dt, 0.0)
-
-            F = np.array([
-                [1.0, dt],
-                [0.0, 1.0],
-            ])
-
-            Q = q * np.array([
-                [dt ** 3 / 3.0, dt ** 2 / 2.0],
-                [dt ** 2 / 2.0, dt],
-            ])
-
-        F_list[k] = F
-
-        xp = F @ x_prev
-        Pp = F @ P_prev @ F.T + Q
-
-        x_pred[k] = xp
-        P_pred[k] = Pp
-
-        innovation = y_sorted[k] - float(H @ xp)
-        S = float(H @ Pp @ H.T + R[k])
-        S = max(S, 1e-12)
-
-        K = (Pp @ H.T) / S
-
-        xf = xp + (K[:, 0] * innovation)
-        Pf = (np.eye(2) - K @ H) @ Pp
-
-        x_filt[k] = xf
-        P_filt[k] = Pf
-
-        x_prev = xf
-        P_prev = Pf
-
-    # RTS smoother
-    x_smooth = x_filt.copy()
-    P_smooth = P_filt.copy()
-
-    for k in range(n - 2, -1, -1):
-        F_next = F_list[k + 1]
-        Pp_next = P_pred[k + 1]
-
-        try:
-            C = P_filt[k] @ F_next.T @ np.linalg.inv(Pp_next)
-        except np.linalg.LinAlgError:
-            C = P_filt[k] @ F_next.T @ np.linalg.pinv(Pp_next)
-
-        x_smooth[k] = x_filt[k] + C @ (x_smooth[k + 1] - x_pred[k + 1])
-        P_smooth[k] = P_filt[k] + C @ (P_smooth[k + 1] - Pp_next) @ C.T
-
-    f_sorted = x_smooth[:, 0]
-    slope_sorted = x_smooth[:, 1]
-
-    residual_sorted = y_sorted - f_sorted
-
-    intrinsic_sigma = _robust_sigma(residual_sorted)
-
-    if not np.isfinite(intrinsic_sigma) or intrinsic_sigma <= 0:
-        intrinsic_sigma = np.nanstd(residual_sorted)
-
-    if not np.isfinite(intrinsic_sigma) or intrinsic_sigma <= 0:
-        intrinsic_sigma = float(np.nanmedian(yerr_sorted))
-
-    total_sigma_sorted = np.sqrt(yerr_sorted ** 2 + intrinsic_sigma ** 2)
-    z_sorted = residual_sorted / np.maximum(total_sigma_sorted, 1e-12)
-
-    f_full = np.full(len(t), np.nan)
-    z_full = np.full(len(t), np.nan)
-    residual_full = np.full(len(t), np.nan)
-
-    f_full[original_sorted_positions] = f_sorted
-    z_full[original_sorted_positions] = z_sorted
-    residual_full[original_sorted_positions] = residual_sorted
-
-    reduced_chi2 = float(np.nanmean(z_sorted ** 2))
-    rmse = float(np.sqrt(np.nanmean(residual_sorted ** 2)))
-
-    return {
-        "success": True,
-        "t_sorted": t_sorted,
-        "y_sorted": y_sorted,
-        "yerr_sorted": yerr_sorted,
-        "f_sorted": f_sorted,
-        "slope_sorted": slope_sorted,
-        "z_sorted": z_sorted,
-        "f_full": f_full,
-        "z_full": z_full,
-        "residual_full": residual_full,
-        "intrinsic_sigma": float(intrinsic_sigma),
-        "reduced_chi2": reduced_chi2,
-        "rmse": rmse,
-        "process_var": q,
-        "process_var_scale": process_var_scale,
-        "model_floor": model_floor_use,
-    }
-
-
-def _predict_from_kalman_model(
-    x_all: np.ndarray,
-    x_train_sorted: np.ndarray,
-    f_train_sorted: np.ndarray,
-) -> np.ndarray:
-    good = (
-        np.isfinite(x_all)
-        & np.isfinite(x_train_sorted).all()
-        & np.isfinite(f_train_sorted).all()
-    )
-
-    if len(x_train_sorted) < 2:
-        return np.full(len(x_all), np.nan)
-
-    order = np.argsort(x_train_sorted)
-    xt = x_train_sorted[order]
-    ft = f_train_sorted[order]
-
-    valid = np.isfinite(xt) & np.isfinite(ft)
-
-    if valid.sum() < 2:
-        return np.full(len(x_all), np.nan)
-
-    return np.interp(x_all, xt[valid], ft[valid])
-
-
-# ============================================================
-# KALMANSAC
-# ============================================================
-
-def kalmansac_fit(
-    x: np.ndarray,
-    y: np.ndarray,
-    yerr: np.ndarray,
-    *,
-    process_var: Optional[float] = None,
-    process_var_scale: float = 0.30,
-    model_floor: Optional[float] = None,
-    n_trials: int = 80,
-    sample_fraction: float = 0.65,
-    consensus_sigma: float = 4.0,
-    refine_iter: int = 3,
-    min_inliers: int = 10,
-    random_state: int = 0,
-) -> Dict[str, Any]:
-    """
-    KALMANSAC = Kalman smoother + RANSAC consensus.
-
-    Why it is useful:
-    - Outliers do not control the model, because each trial fits only a subset.
-    - The final model is selected by maximum consensus.
-    - Then it is refined on the consensus inliers.
-
-    Output:
-    - inlier_mask
-    - outlier_mask
-    - f_all
-    - z_all
-    - model
-    """
-    rng = np.random.default_rng(random_state)
-
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    yerr = _safe_yerr(np.asarray(yerr, dtype=float))
-
-    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
-
-    if finite.sum() < 4:
         return {
-            "success": False,
-            "reason": "not_enough_valid_points_for_kalmansac",
-            "inlier_mask": finite.copy(),
-            "outlier_mask": ~finite,
-            "f_all": np.full(len(x), np.nan),
-            "z_all": np.full(len(x), np.nan),
-            "model": None,
+            "signal": float(signal) if np.isfinite(signal) else np.nan,
+            "noise": float(noise) if np.isfinite(noise) else np.nan,
+            "snr": np.nan,
+            "noise_signal_ratio": np.inf,
+            "snr_reason": "invalid_or_zero_signal",
         }
 
-    valid_positions = np.where(finite)[0]
-    N = len(valid_positions)
-
-    sample_size = int(np.ceil(sample_fraction * N))
-    sample_size = max(4, min(sample_size, N))
-
-    best_score = -np.inf
-    best_inlier_mask_valid = None
-    best_model = None
-    best_f_valid = None
-    best_z_valid = None
-
-    x_valid = x[finite]
-    y_valid = y[finite]
-    yerr_valid = yerr[finite]
-
-    trial_masks = []
-
-    # Always try all-data model once.
-    trial_masks.append(np.ones(N, dtype=bool))
-
-    for _ in range(int(n_trials)):
-        mask = np.zeros(N, dtype=bool)
-        chosen = rng.choice(N, size=sample_size, replace=False)
-        mask[chosen] = True
-        trial_masks.append(mask)
-
-    for trial_mask in trial_masks:
-        if trial_mask.sum() < 4:
-            continue
-
-        try:
-            model = kalman_smoother_constant_velocity(
-                x_valid[trial_mask],
-                y_valid[trial_mask],
-                yerr_valid[trial_mask],
-                process_var=process_var,
-                process_var_scale=process_var_scale,
-                model_floor=model_floor,
-            )
-
-            f_valid = _predict_from_kalman_model(
-                x_valid,
-                model["t_sorted"],
-                model["f_sorted"],
-            )
-
-            residual = y_valid - f_valid
-
-            intrinsic_sigma = _robust_sigma(residual[trial_mask])
-
-            if not np.isfinite(intrinsic_sigma) or intrinsic_sigma <= 0:
-                intrinsic_sigma = model["intrinsic_sigma"]
-
-            if not np.isfinite(intrinsic_sigma) or intrinsic_sigma <= 0:
-                intrinsic_sigma = np.nanmedian(yerr_valid)
-
-            total_sigma = np.sqrt(yerr_valid ** 2 + intrinsic_sigma ** 2)
-            z_valid = residual / np.maximum(total_sigma, 1e-12)
-
-            inlier_mask_valid = np.isfinite(z_valid) & (np.abs(z_valid) <= consensus_sigma)
-
-            n_inliers = int(inlier_mask_valid.sum())
-
-            if n_inliers < max(4, min_inliers):
-                continue
-
-            median_abs_z = float(np.nanmedian(np.abs(z_valid[inlier_mask_valid])))
-            robust_loss = float(np.nanmean(np.minimum(z_valid ** 2, consensus_sigma ** 2)))
-
-            score = n_inliers - 0.05 * median_abs_z - 0.01 * robust_loss
-
-            if score > best_score:
-                best_score = score
-                best_inlier_mask_valid = inlier_mask_valid.copy()
-                best_model = model
-                best_f_valid = f_valid.copy()
-                best_z_valid = z_valid.copy()
-
-        except Exception:
-            continue
-
-    if best_inlier_mask_valid is None:
+    if not np.isfinite(noise) or noise <= 0:
         return {
-            "success": False,
-            "reason": "no_valid_kalmansac_consensus",
-            "inlier_mask": finite.copy(),
-            "outlier_mask": ~finite,
-            "f_all": np.full(len(x), np.nan),
-            "z_all": np.full(len(x), np.nan),
-            "model": None,
+            "signal": float(signal),
+            "noise": float(noise) if np.isfinite(noise) else np.nan,
+            "snr": np.nan,
+            "noise_signal_ratio": np.nan,
+            "snr_reason": "invalid_or_zero_noise",
         }
 
-    inlier_mask_valid = best_inlier_mask_valid.copy()
-
-    # Refinement on consensus inliers.
-    for _ in range(int(refine_iter)):
-        if inlier_mask_valid.sum() < 4:
-            break
-
-        try:
-            model = kalman_smoother_constant_velocity(
-                x_valid[inlier_mask_valid],
-                y_valid[inlier_mask_valid],
-                yerr_valid[inlier_mask_valid],
-                process_var=process_var,
-                process_var_scale=process_var_scale,
-                model_floor=model_floor,
-            )
-
-            f_valid = _predict_from_kalman_model(
-                x_valid,
-                model["t_sorted"],
-                model["f_sorted"],
-            )
-
-            residual = y_valid - f_valid
-
-            intrinsic_sigma = _robust_sigma(residual[inlier_mask_valid])
-
-            if not np.isfinite(intrinsic_sigma) or intrinsic_sigma <= 0:
-                intrinsic_sigma = model["intrinsic_sigma"]
-
-            if not np.isfinite(intrinsic_sigma) or intrinsic_sigma <= 0:
-                intrinsic_sigma = np.nanmedian(yerr_valid)
-
-            total_sigma = np.sqrt(yerr_valid ** 2 + intrinsic_sigma ** 2)
-            z_valid = residual / np.maximum(total_sigma, 1e-12)
-
-            new_inlier_mask_valid = np.isfinite(z_valid) & (np.abs(z_valid) <= consensus_sigma)
-
-            if np.array_equal(new_inlier_mask_valid, inlier_mask_valid):
-                best_model = model
-                best_f_valid = f_valid
-                best_z_valid = z_valid
-                break
-
-            inlier_mask_valid = new_inlier_mask_valid
-            best_model = model
-            best_f_valid = f_valid
-            best_z_valid = z_valid
-
-        except Exception:
-            break
-
-    inlier_mask_full = np.zeros(len(x), dtype=bool)
-    outlier_mask_full = np.zeros(len(x), dtype=bool)
-    f_all = np.full(len(x), np.nan)
-    z_all = np.full(len(x), np.nan)
-
-    inlier_mask_full[valid_positions] = inlier_mask_valid
-    outlier_mask_full[valid_positions] = ~inlier_mask_valid
-    outlier_mask_full[~finite] = True
-
-    f_all[valid_positions] = best_f_valid
-    z_all[valid_positions] = best_z_valid
-
-    n_valid = int(finite.sum())
-    n_inliers = int(inlier_mask_full.sum())
-    n_outliers = int(outlier_mask_full[finite].sum())
-
-    outlier_fraction = n_outliers / max(n_valid, 1)
+    snr = float(signal / noise)
+    nsr = float(noise / signal)
 
     return {
-        "success": True,
-        "reason": "ok",
-        "inlier_mask": inlier_mask_full,
-        "outlier_mask": outlier_mask_full,
-        "f_all": f_all,
-        "z_all": z_all,
-        "model": best_model,
-        "n_valid": n_valid,
-        "n_inliers": n_inliers,
-        "n_outliers": n_outliers,
-        "outlier_fraction": outlier_fraction,
-        "score": best_score,
+        "signal": float(signal),
+        "noise": float(noise),
+        "snr": snr,
+        "noise_signal_ratio": nsr,
+        "snr_reason": "ok",
     }
 
 
-def clean_source_with_kalmansac(
-    sub: pd.DataFrame,
+def _should_remove_by_snr(
+    snr_metrics: Dict[str, Any],
     *,
-    time_col: str,
-    y_col: str = DEFAULT_Y_COL,
-    yerr_col: str = DEFAULT_YERR_COL,
+    min_snr: Optional[float],
+    max_noise_signal_ratio: Optional[float],
+    remove_if_snr_nan: bool,
+) -> Tuple[bool, str]:
+    snr = snr_metrics.get("snr", np.nan)
+    nsr = snr_metrics.get("noise_signal_ratio", np.nan)
+    reason = snr_metrics.get("snr_reason", "unknown")
 
-    process_var: Optional[float] = None,
-    process_var_scale: float = 0.30,
-    model_floor: Optional[float] = None,
+    if remove_if_snr_nan and not np.isfinite(snr):
+        return True, f"bad_snr_nan_or_invalid ({reason})"
 
-    n_trials: int = 80,
-    sample_fraction: float = 0.65,
-    consensus_sigma: float = 4.0,
-    refine_iter: int = 3,
-    min_inliers: int = 10,
-    random_state: int = 0,
-) -> Dict[str, Any]:
+    if min_snr is not None and np.isfinite(snr) and snr < float(min_snr):
+        return True, f"bad_snr_low (snr={snr:.3f} < min_snr={float(min_snr):.3f})"
 
-    x_all = _time_to_days(sub[time_col])
-    y_all = pd.to_numeric(sub[y_col], errors="coerce").to_numpy(dtype=float)
+    if max_noise_signal_ratio is not None and np.isfinite(nsr) and nsr > float(max_noise_signal_ratio):
+        return True, f"bad_noise_signal_ratio (nsr={nsr:.3f} > max_nsr={float(max_noise_signal_ratio):.3f})"
 
-    if yerr_col in sub.columns:
-        yerr_all = pd.to_numeric(sub[yerr_col], errors="coerce").to_numpy(dtype=float)
-    else:
-        yerr_all = np.ones_like(y_all)
-
-    yerr_all = _safe_yerr(yerr_all)
-
-    result = kalmansac_fit(
-        x_all,
-        y_all,
-        yerr_all,
-        process_var=process_var,
-        process_var_scale=process_var_scale,
-        model_floor=model_floor,
-        n_trials=n_trials,
-        sample_fraction=sample_fraction,
-        consensus_sigma=consensus_sigma,
-        refine_iter=refine_iter,
-        min_inliers=min_inliers,
-        random_state=random_state,
-    )
-
-    return result
+    return False, ""
 
 
-# ============================================================
-# PLOTTING
-# ============================================================
-
-def _plot_kalmansac_result(
-    sub: pd.DataFrame,
-    *,
-    time_col: str,
-    y_col: str,
-    yerr_col: str,
-    title: str,
-    reason: str,
-    result: Optional[Dict[str, Any]] = None,
-    removed_mask: Optional[np.ndarray] = None,
-):
-    x = _time_to_days(sub[time_col])
-    y = pd.to_numeric(sub[y_col], errors="coerce").to_numpy(dtype=float)
-
-    if yerr_col in sub.columns:
-        yerr = pd.to_numeric(sub[yerr_col], errors="coerce").to_numpy(dtype=float)
-    else:
-        yerr = np.full_like(y, np.nan)
-
-    if removed_mask is None:
-        removed_mask = np.zeros(len(sub), dtype=bool)
-
-    removed_mask = np.asarray(removed_mask, dtype=bool)
-
-    if len(removed_mask) != len(sub):
-        removed_mask = np.zeros(len(sub), dtype=bool)
-
-    kept = ~removed_mask
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-
-    has_err = np.isfinite(yerr).any()
-
-    if has_err:
-        ax.errorbar(
-            x[kept],
-            y[kept],
-            yerr=yerr[kept],
-            fmt="o",
-            markersize=4,
-            capsize=2,
-            alpha=0.75,
-            label="kept points",
-        )
-
-        if removed_mask.any():
-            ax.errorbar(
-                x[removed_mask],
-                y[removed_mask],
-                yerr=yerr[removed_mask],
-                fmt="x",
-                markersize=7,
-                capsize=2,
-                alpha=0.95,
-                label="removed points",
-            )
-    else:
-        ax.plot(
-            x[kept],
-            y[kept],
-            "o",
-            markersize=4,
-            alpha=0.75,
-            label="kept points",
-        )
-
-        if removed_mask.any():
-            ax.plot(
-                x[removed_mask],
-                y[removed_mask],
-                "x",
-                markersize=7,
-                alpha=0.95,
-                label="removed points",
-            )
-
-    if result is not None and result.get("success", False):
-        f_all = result["f_all"]
-        order = np.argsort(x)
-
-        ax.plot(
-            x[order],
-            f_all[order],
-            linewidth=2,
-            label="KALMANSAC fit",
-        )
-
-    ax.set_title(f"{title}\n{reason}")
-    ax.set_xlabel(f"{time_col} converted to numeric days")
-    ax.set_ylabel(y_col)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    plt.show()
-
-
-# ============================================================
-# MAIN PREPROCESSING
-# ============================================================
-
-def preprocess_lightcurves_kalmansac(
+def pretraitement(
     data: Any,
     *,
+    output_dir: str | Path = "pretraitement_outputs",
+    clean_filename: str = "cleaned_lightcurves.csv",
+    report_filename: str = "pretraitement_report.csv",
+    removed_points_filename: str = "removed_points.csv",
+    summary_filename: str = "pretraitement_summary.txt",
+
+    # Columns
     time_col: Optional[str] = None,
     y_col: str = DEFAULT_Y_COL,
     yerr_col: str = DEFAULT_YERR_COL,
     source_col: str = DEFAULT_SOURCE_COL,
     component_col: Optional[str] = DEFAULT_COMPONENT_COL,
 
-    # First X sources
-    max_sources: Optional[int] = 2000,
+    # Source/component selection
+    max_sources: Optional[int] = None,
     source_selection: str = "first",
+    random_state: int = 0,
 
-    # Bi-daily aggregation
-    do_bi_daily: bool = True,
-    bin_days: float = 2.0,
+    # Notebook binning
+    do_binning: bool = True,
+    bin_days: float = 4.0,
     error_mode: str = "mean",
 
-    # SNR
+    # Notebook adaptive rolling hybrid bands
+    half_window: int = 5,
+    alpha: float = 0.7,
+    c: float = 2.5,
+    exclude_center: bool = True,
+    sigma_threshold: float = 4.0,
+
+    # SNR filtering inside Pretraitement.py
     do_snr_filter: bool = True,
     snr_signal_mode: str = "amplitude",
-    min_snr: Optional[float] = 1.0,
+    min_snr: Optional[float] = 0.8,
     max_noise_signal_ratio: Optional[float] = None,
     remove_if_snr_nan: bool = False,
 
-    # KALMANSAC
-    process_var: Optional[float] = None,
-    process_var_scale: float = 0.30,
-    model_floor: Optional[float] = None,
-    n_trials: int = 80,
-    sample_fraction: float = 0.65,
-    consensus_sigma: float = 4.0,
-    refine_iter: int = 3,
-    min_inliers: int = 10,
-
-    # Source-level removal
+    # Source/component removal rules
+    min_points_before: int = 3,
     min_points_after: int = 20,
     max_outlier_fraction: float = 0.50,
 
-    # Display
-    show_removed_plots: bool = True,
-    max_plots: Optional[int] = 50,
+    # Output behavior
+    save: bool = True,
     verbose: bool = True,
-    random_state: int = 0,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> PretraitementResult:
+    """
+    Clean light curves and save a local cleaned CSV.
 
-    df0_all = read_lightcurve_data(data)
+    Parameters are chosen to match `PreProcessingTest.ipynb` by default:
+    - `bin_days=4.0` because the notebook uses `// 4`,
+    - `half_window=5`, `alpha=0.7`, `c=2.5`, `exclude_center=True`,
+    - outliers are points with |flux - rolling_median| > sigma_threshold * hybrid_sigma.
+    """
+    df_all = read_lightcurve_data(data)
 
     if time_col is None:
-        time_col = guess_time_col(df0_all)
+        time_col = guess_time_col(df_all)
 
-    group_cols = _safe_group_cols(df0_all, source_col, component_col)
+    group_cols = _safe_group_cols(df_all, source_col, component_col)
+    missing = [c for c in group_cols + [time_col, y_col] if c not in df_all.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}. Available columns: {list(df_all.columns)}")
 
-    df0, source_limit_info = limit_first_sources(
-        df0_all,
+    initial_rows = int(len(df_all))
+    initial_groups = int(df_all[group_cols].drop_duplicates().shape[0])
+
+    selected_df, source_limit_info = limit_first_sources(
+        df_all,
         group_cols=group_cols,
         max_sources=max_sources,
         source_selection=source_selection,
         random_state=random_state,
     )
 
-    if verbose:
-        print("\n========== SOURCE LIMIT ==========")
-        print(f"Total source/component groups available: {source_limit_info['total_sources_available'].iloc[0]}")
-        print(f"Selected source/component groups: {source_limit_info['selected_sources'].iloc[0]}")
-        print(f"max_sources: {max_sources}")
-        print(f"source_selection: {source_selection}")
-        print("==================================\n")
+    selected_rows = int(len(selected_df))
+    selected_groups = int(source_limit_info["selected_source_component_groups"].iloc[0])
 
-    if do_bi_daily:
-        df = aggregate_bi_daily(
-            df0,
+    if do_binning:
+        work_df = aggregate_by_notebook_bins(
+            selected_df,
             time_col=time_col,
             y_col=y_col,
             yerr_col=yerr_col,
@@ -1172,24 +547,35 @@ def preprocess_lightcurves_kalmansac(
             error_mode=error_mode,
         )
     else:
-        df = df0.copy()
+        work_df = selected_df.copy()
+        work_df[time_col] = pd.to_numeric(work_df[time_col], errors="coerce")
+        work_df[y_col] = pd.to_numeric(work_df[y_col], errors="coerce")
 
-    group_cols = _safe_group_cols(df, source_col, component_col)
+        if yerr_col in work_df.columns:
+            work_df[yerr_col] = pd.to_numeric(work_df[yerr_col], errors="coerce")
+        else:
+            work_df[yerr_col] = np.nan
 
-    df = df.copy()
-    df["_pre_keep"] = True
-    df["_pre_removed_reason"] = ""
+        work_df = (
+            work_df
+            .dropna(subset=[time_col, y_col])
+            .sort_values(group_cols + [time_col])
+            .reset_index(drop=True)
+        )
 
-    source_reports = []
-    removed_points = []
-    plot_count = 0
+    group_cols = _safe_group_cols(work_df, source_col, component_col)
 
-    for group_i, (keys, sub) in enumerate(df.groupby(group_cols, sort=False)):
-        sub = sub.copy()
+    work_df = work_df.copy()
+    work_df["_pre_keep"] = True
+    work_df["_pre_removed_reason"] = ""
+
+    reports: List[Dict[str, Any]] = []
+    removed_points: List[pd.DataFrame] = []
+
+    for keys, sub in work_df.groupby(group_cols, sort=False):
+        group_name = _group_title(keys, group_cols)
         idx = sub.index.to_numpy()
-        group_title = _get_group_title(keys, group_cols)
-
-        n_after_aggregation = len(sub)
+        n_after_binning = int(len(sub))
 
         snr_metrics = compute_snr_metrics(
             sub,
@@ -1198,335 +584,230 @@ def preprocess_lightcurves_kalmansac(
             signal_mode=snr_signal_mode,
         )
 
-        signal = snr_metrics["signal"]
-        noise = snr_metrics["noise"]
-        snr = snr_metrics["snr"]
-        nsr = snr_metrics["noise_signal_ratio"]
-        snr_reason = snr_metrics["snr_reason"]
+        remove_by_snr, snr_remove_reason = _should_remove_by_snr(
+            snr_metrics,
+            min_snr=min_snr if do_snr_filter else None,
+            max_noise_signal_ratio=max_noise_signal_ratio if do_snr_filter else None,
+            remove_if_snr_nan=remove_if_snr_nan if do_snr_filter else False,
+        )
 
-        # SNR filter
-        remove_by_snr = False
-        snr_remove_reason = ""
-
-        if do_snr_filter:
-            if remove_if_snr_nan and not np.isfinite(snr):
-                remove_by_snr = True
-                snr_remove_reason = f"bad_snr_nan_or_invalid ({snr_reason})"
-
-            if min_snr is not None and np.isfinite(snr) and snr < min_snr:
-                remove_by_snr = True
-                snr_remove_reason = f"bad_snr_low (snr={snr:.3f} < min_snr={min_snr})"
-
-            if (
-                max_noise_signal_ratio is not None
-                and np.isfinite(nsr)
-                and nsr > max_noise_signal_ratio
-            ):
-                remove_by_snr = True
-                snr_remove_reason = (
-                    f"bad_noise_signal_ratio "
-                    f"(nsr={nsr:.3f} > max_nsr={max_noise_signal_ratio})"
-                )
+        base_report = {
+            "group": group_name,
+            "n_after_binning": n_after_binning,
+            "signal": snr_metrics["signal"],
+            "noise": snr_metrics["noise"],
+            "snr": snr_metrics["snr"],
+            "noise_signal_ratio": snr_metrics["noise_signal_ratio"],
+            "snr_reason": snr_metrics["snr_reason"],
+        }
 
         if remove_by_snr:
-            df.loc[idx, "_pre_keep"] = False
-            df.loc[idx, "_pre_removed_reason"] = snr_remove_reason
+            work_df.loc[idx, "_pre_keep"] = False
+            work_df.loc[idx, "_pre_removed_reason"] = snr_remove_reason
 
-            source_reports.append({
-                "group": group_title,
-                "removed": True,
-                "reason": snr_remove_reason,
-                "n_after_aggregation": n_after_aggregation,
-                "n_final": 0,
+            reports.append({
+                **base_report,
+                "removed_source": True,
+                "source_reason": snr_remove_reason,
                 "n_removed_points": 0,
+                "n_final": 0,
                 "outlier_fraction": np.nan,
-                "signal": signal,
-                "noise": noise,
-                "snr": snr,
-                "noise_signal_ratio": nsr,
-                "snr_reason": snr_reason,
-                "kalmansac_success": np.nan,
-                "kalmansac_score": np.nan,
-                "process_var": np.nan,
-                "reduced_chi2": np.nan,
-                "intrinsic_sigma": np.nan,
-                "rmse": np.nan,
+                "max_abs_local_z": np.nan,
             })
-
-            if verbose:
-                print(f"REMOVED SOURCE: {group_title} | {snr_remove_reason}")
-
-            if show_removed_plots and (max_plots is None or plot_count < max_plots):
-                _plot_kalmansac_result(
-                    sub,
-                    time_col=time_col,
-                    y_col=y_col,
-                    yerr_col=yerr_col,
-                    title=group_title,
-                    reason=snr_remove_reason,
-                )
-                plot_count += 1
-
             continue
 
-        if n_after_aggregation < 4:
-            reason = "too_few_points_for_kalmansac"
+        if n_after_binning < int(min_points_before):
+            reason = f"less_than_{int(min_points_before)}_points_before_cleaning"
+            work_df.loc[idx, "_pre_keep"] = False
+            work_df.loc[idx, "_pre_removed_reason"] = reason
 
-            df.loc[idx, "_pre_keep"] = False
-            df.loc[idx, "_pre_removed_reason"] = reason
-
-            source_reports.append({
-                "group": group_title,
-                "removed": True,
-                "reason": reason,
-                "n_after_aggregation": n_after_aggregation,
-                "n_final": 0,
+            reports.append({
+                **base_report,
+                "removed_source": True,
+                "source_reason": reason,
                 "n_removed_points": 0,
+                "n_final": 0,
                 "outlier_fraction": np.nan,
-                "signal": signal,
-                "noise": noise,
-                "snr": snr,
-                "noise_signal_ratio": nsr,
-                "snr_reason": snr_reason,
-                "kalmansac_success": False,
-                "kalmansac_score": np.nan,
-                "process_var": np.nan,
-                "reduced_chi2": np.nan,
-                "intrinsic_sigma": np.nan,
-                "rmse": np.nan,
+                "max_abs_local_z": np.nan,
             })
-
-            if verbose:
-                print(f"REMOVED SOURCE: {group_title} | {reason}")
-
             continue
 
-        try:
-            result = clean_source_with_kalmansac(
-                sub,
-                time_col=time_col,
-                y_col=y_col,
-                yerr_col=yerr_col,
-                process_var=process_var,
-                process_var_scale=process_var_scale,
-                model_floor=model_floor,
-                n_trials=n_trials,
-                sample_fraction=sample_fraction,
-                consensus_sigma=consensus_sigma,
-                refine_iter=refine_iter,
-                min_inliers=min_inliers,
-                random_state=random_state + group_i,
+        scored = adaptive_rolling_hybrid_scores(
+            sub,
+            y_col=y_col,
+            time_col=time_col,
+            half_window=half_window,
+            alpha=alpha,
+            c=c,
+            exclude_center=exclude_center,
+        )
+
+        original_idx = scored["_original_index"].to_numpy()
+        local_z = scored["pre_local_z"].to_numpy(dtype=float)
+
+        outlier_mask = np.isfinite(local_z) & (np.abs(local_z) > float(sigma_threshold))
+        removed_idx = original_idx[outlier_mask]
+
+        if len(removed_idx) > 0:
+            work_df.loc[removed_idx, "_pre_keep"] = False
+            work_df.loc[removed_idx, "_pre_removed_reason"] = "adaptive_rolling_hybrid_outlier"
+
+            rm = scored.loc[outlier_mask].copy()
+            rm["_pre_removed_reason"] = "adaptive_rolling_hybrid_outlier"
+            removed_points.append(rm.drop(columns=["_original_index"], errors="ignore"))
+
+        n_removed = int(outlier_mask.sum())
+        n_final = int(n_after_binning - n_removed)
+        outlier_fraction = float(n_removed / max(n_after_binning, 1))
+
+        source_reason = "kept_after_adaptive_rolling_hybrid_cleaning"
+        remove_source = False
+
+        if n_final < int(min_points_after):
+            source_reason = f"less_than_{int(min_points_after)}_points_after_cleaning"
+            remove_source = True
+        elif outlier_fraction > float(max_outlier_fraction):
+            source_reason = (
+                f"too_many_outliers "
+                f"(outlier_fraction={outlier_fraction:.3f} > {float(max_outlier_fraction):.3f})"
             )
+            remove_source = True
 
-            if not result["success"]:
-                reason = f"kalmansac_failed: {result['reason']}"
+        if remove_source:
+            work_df.loc[idx, "_pre_keep"] = False
+            work_df.loc[idx, "_pre_removed_reason"] = source_reason
+            n_final = 0
 
-                df.loc[idx, "_pre_keep"] = False
-                df.loc[idx, "_pre_removed_reason"] = reason
+        reports.append({
+            **base_report,
+            "removed_source": bool(remove_source),
+            "source_reason": source_reason,
+            "n_removed_points": n_removed,
+            "n_final": n_final,
+            "outlier_fraction": outlier_fraction,
+            "max_abs_local_z": float(np.nanmax(np.abs(local_z))) if np.isfinite(local_z).any() else np.nan,
+        })
 
-                source_reports.append({
-                    "group": group_title,
-                    "removed": True,
-                    "reason": reason,
-                    "n_after_aggregation": n_after_aggregation,
-                    "n_final": 0,
-                    "n_removed_points": 0,
-                    "outlier_fraction": np.nan,
-                    "signal": signal,
-                    "noise": noise,
-                    "snr": snr,
-                    "noise_signal_ratio": nsr,
-                    "snr_reason": snr_reason,
-                    "kalmansac_success": False,
-                    "kalmansac_score": np.nan,
-                    "process_var": np.nan,
-                    "reduced_chi2": np.nan,
-                    "intrinsic_sigma": np.nan,
-                    "rmse": np.nan,
-                })
+    clean_df = (
+        work_df[work_df["_pre_keep"]]
+        .copy()
+        .drop(columns=["_pre_keep", "_pre_removed_reason"], errors="ignore")
+    )
 
-                if verbose:
-                    print(f"REMOVED SOURCE: {group_title} | {reason}")
+    removed_rows_df = (
+        work_df[~work_df["_pre_keep"]]
+        .copy()
+        .drop(columns=["_pre_keep"], errors="ignore")
+    )
 
-                continue
+    source_report = pd.DataFrame(reports)
+    removed_points_df = pd.concat(removed_points, ignore_index=True) if removed_points else pd.DataFrame()
 
-            removed_mask = result["outlier_mask"]
-            removed_idx = idx[removed_mask]
+    n_removed_rows = int(len(removed_rows_df))
+    n_removed_groups = int(source_report["removed_source"].sum()) if len(source_report) else 0
+    n_clean_groups = int(clean_df[group_cols].drop_duplicates().shape[0]) if len(clean_df) else 0
 
-            if len(removed_idx) > 0:
-                df.loc[removed_idx, "_pre_keep"] = False
-                df.loc[removed_idx, "_pre_removed_reason"] = f"kalmansac_{consensus_sigma:g}sigma_outlier"
+    summary: Dict[str, Any] = {
+        "input_rows": initial_rows,
+        "input_source_component_groups": initial_groups,
+        "selected_rows": selected_rows,
+        "selected_source_component_groups": selected_groups,
+        "rows_after_binning": int(len(work_df)),
+        "clean_rows": int(len(clean_df)),
+        "removed_rows": n_removed_rows,
+        "clean_source_component_groups": n_clean_groups,
+        "removed_source_component_groups": n_removed_groups,
+        "removed_individual_outlier_points": int(len(removed_points_df)),
+        "bin_days": float(bin_days) if do_binning else None,
+        "half_window": int(half_window),
+        "sigma_threshold": float(sigma_threshold),
+        "snr_filter_enabled": bool(do_snr_filter),
+        "min_snr": min_snr,
+        "max_noise_signal_ratio": max_noise_signal_ratio,
+    }
 
-                tmp_removed = sub.loc[removed_idx].copy()
-                tmp_removed["_pre_removed_reason"] = f"kalmansac_{consensus_sigma:g}sigma_outlier"
-                tmp_removed["_pre_z_score"] = result["z_all"][removed_mask]
-                tmp_removed["_pre_kalmansac_fit"] = result["f_all"][removed_mask]
-                removed_points.append(tmp_removed)
+    output_dir = Path(output_dir)
+    clean_csv_path = output_dir / clean_filename
+    report_csv_path = output_dir / report_filename
+    removed_points_csv_path = output_dir / removed_points_filename
+    summary_txt_path = output_dir / summary_filename
 
-            remove_whole_source = False
-            source_reason = "kept_after_kalmansac_cleaning"
+    if save:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-            if result["n_inliers"] < min_points_after:
-                remove_whole_source = True
-                source_reason = f"less_than_{min_points_after}_points_after_preprocessing"
+        clean_df.to_csv(clean_csv_path, index=False)
+        source_report.to_csv(report_csv_path, index=False)
+        removed_points_df.to_csv(removed_points_csv_path, index=False)
 
-            elif result["outlier_fraction"] > max_outlier_fraction:
-                remove_whole_source = True
-                source_reason = (
-                    f"too_many_kalmansac_outliers "
-                    f"(outlier_fraction={result['outlier_fraction']:.3f} > {max_outlier_fraction})"
-                )
+        lines = ["PRETRAITEMENT SUMMARY", "====================", ""]
+        for key, value in summary.items():
+            lines.append(f"{key}: {value}")
 
-            if remove_whole_source:
-                df.loc[idx, "_pre_keep"] = False
-                df.loc[idx, "_pre_removed_reason"] = source_reason
-
-                if verbose:
-                    print(f"REMOVED SOURCE: {group_title} | {source_reason}")
-
-                if show_removed_plots and (max_plots is None or plot_count < max_plots):
-                    _plot_kalmansac_result(
-                        sub,
-                        time_col=time_col,
-                        y_col=y_col,
-                        yerr_col=yerr_col,
-                        title=group_title,
-                        reason=source_reason,
-                        result=result,
-                        removed_mask=removed_mask,
-                    )
-                    plot_count += 1
-
+        if len(source_report):
+            lines.extend(["", "Removed source/component groups by reason:"])
+            counts = source_report.loc[source_report["removed_source"], "source_reason"].value_counts()
+            if len(counts):
+                for reason, count in counts.items():
+                    lines.append(f"- {reason}: {count}")
             else:
-                if verbose and len(removed_idx) > 0:
-                    print(
-                        f"POINTS REMOVED: {group_title} | "
-                        f"{len(removed_idx)} point(s), "
-                        f"outlier_fraction={result['outlier_fraction']:.3f}"
-                    )
+                lines.append("- none")
 
-                if (
-                    show_removed_plots
-                    and len(removed_idx) > 0
-                    and (max_plots is None or plot_count < max_plots)
-                ):
-                    _plot_kalmansac_result(
-                        sub,
-                        time_col=time_col,
-                        y_col=y_col,
-                        yerr_col=yerr_col,
-                        title=group_title,
-                        reason=f"{len(removed_idx)} KALMANSAC outlier point(s)",
-                        result=result,
-                        removed_mask=removed_mask,
-                    )
-                    plot_count += 1
-
-            model = result["model"]
-
-            source_reports.append({
-                "group": group_title,
-                "removed": bool(remove_whole_source),
-                "reason": source_reason,
-                "n_after_aggregation": n_after_aggregation,
-                "n_final": 0 if remove_whole_source else result["n_inliers"],
-                "n_removed_points": result["n_outliers"],
-                "outlier_fraction": result["outlier_fraction"],
-                "signal": signal,
-                "noise": noise,
-                "snr": snr,
-                "noise_signal_ratio": nsr,
-                "snr_reason": snr_reason,
-                "kalmansac_success": True,
-                "kalmansac_score": result["score"],
-                "process_var": model["process_var"] if model is not None else np.nan,
-                "reduced_chi2": model["reduced_chi2"] if model is not None else np.nan,
-                "intrinsic_sigma": model["intrinsic_sigma"] if model is not None else np.nan,
-                "rmse": model["rmse"] if model is not None else np.nan,
-            })
-
-        except Exception as exc:
-            reason = f"kalmansac_cleaning_failed: {type(exc).__name__}: {exc}"
-
-            df.loc[idx, "_pre_keep"] = False
-            df.loc[idx, "_pre_removed_reason"] = reason
-
-            source_reports.append({
-                "group": group_title,
-                "removed": True,
-                "reason": reason,
-                "n_after_aggregation": n_after_aggregation,
-                "n_final": 0,
-                "n_removed_points": 0,
-                "outlier_fraction": np.nan,
-                "signal": signal,
-                "noise": noise,
-                "snr": snr,
-                "noise_signal_ratio": nsr,
-                "snr_reason": snr_reason,
-                "kalmansac_success": False,
-                "kalmansac_score": np.nan,
-                "process_var": np.nan,
-                "reduced_chi2": np.nan,
-                "intrinsic_sigma": np.nan,
-                "rmse": np.nan,
-            })
-
-            if verbose:
-                print(f"REMOVED SOURCE: {group_title} | {reason}")
-
-    clean_df = df[df["_pre_keep"]].copy()
-    removed_rows_df = df[~df["_pre_keep"]].copy()
-
-    if removed_points:
-        removed_points_df = pd.concat(removed_points, ignore_index=True)
-    else:
-        removed_points_df = pd.DataFrame()
-
-    source_report = pd.DataFrame(source_reports)
-
-    clean_df = clean_df.drop(columns=["_pre_keep"], errors="ignore")
-    removed_rows_df = removed_rows_df.drop(columns=["_pre_keep"], errors="ignore")
+        summary_txt_path.write_text("\n".join(lines), encoding="utf-8")
 
     if verbose:
-        print("\n========== KALMANSAC PREPROCESSING SUMMARY ==========")
-        print(f"Initial rows in full input: {len(df0_all)}")
-        print(f"Rows selected by max_sources: {len(df0)}")
-        print(f"Rows after bi-daily aggregation: {len(df)}")
-        print(f"Final clean rows: {len(clean_df)}")
-        print(f"Removed rows: {len(removed_rows_df)}")
-        print(f"Removed individual points: {len(removed_points_df)}")
+        print("\n========== PRETRAITEMENT SUMMARY ==========")
+        for key, value in summary.items():
+            print(f"{key}: {value}")
 
-        if len(source_report) > 0:
+        if len(source_report):
             print("\nRemoved source/component groups by reason:")
-            print(source_report[source_report["removed"] == True]["reason"].value_counts())
+            counts = source_report.loc[source_report["removed_source"], "source_reason"].value_counts()
+            print(counts if len(counts) else "none")
 
-        print("====================================================\n")
+        if save:
+            print("\nLocal outputs saved to:")
+            print(f"clean csv: {clean_csv_path}")
+            print(f"report csv: {report_csv_path}")
+            print(f"removed points csv: {removed_points_csv_path}")
+            print(f"summary txt: {summary_txt_path}")
 
-    return clean_df.reset_index(drop=True), source_report, removed_points_df.reset_index(drop=True)
+        print("===========================================\n")
+
+    return PretraitementResult(
+        clean_df=clean_df.reset_index(drop=True),
+        source_report=source_report.reset_index(drop=True),
+        removed_points_df=removed_points_df.reset_index(drop=True),
+        summary=summary,
+        clean_csv_path=clean_csv_path,
+        report_csv_path=report_csv_path,
+        removed_points_csv_path=removed_points_csv_path,
+        summary_txt_path=summary_txt_path,
+    )
 
 
-# Alias so old notebook call works.
-preprocess_lightcurves = preprocess_lightcurves_kalmansac
+# Backward-compatible aliases.
+run_pretraitement = pretraitement
+preprocess_lightcurves = pretraitement
+preprocess_lightcurves_notebook_method = pretraitement
 
 
-# ============================================================
-# SAVE OUTPUTS
-# ============================================================
+if __name__ == "__main__":
+    import argparse
 
-def save_preprocessing_outputs(
-    clean_df: pd.DataFrame,
-    source_report: pd.DataFrame,
-    removed_points_df: pd.DataFrame,
-    *,
-    clean_path: str = "clean_lightcurves.csv",
-    report_path: str = "preprocessing_report.csv",
-    removed_points_path: str = "removed_points.csv",
-):
-    clean_df.to_csv(clean_path, index=False)
-    source_report.to_csv(report_path, index=False)
-    removed_points_df.to_csv(removed_points_path, index=False)
+    parser = argparse.ArgumentParser(description="Clean light curves and save local CSV outputs.")
+    parser.add_argument("input_csv", help="Input CSV path")
+    parser.add_argument("--output-dir", default="pretraitement_outputs", help="Local output directory")
+    parser.add_argument("--max-sources", type=int, default=None, help="Optional first-N source/component groups")
+    parser.add_argument("--min-snr", type=float, default=0.8, help="Minimum source/component SNR")
+    parser.add_argument("--sigma-threshold", type=float, default=4.0, help="Adaptive rolling hybrid outlier threshold")
 
-    print(f"Saved clean data to: {clean_path}")
-    print(f"Saved report to: {report_path}")
-    print(f"Saved removed points to: {removed_points_path}")
+    args = parser.parse_args()
+
+    pretraitement(
+        args.input_csv,
+        output_dir=args.output_dir,
+        max_sources=args.max_sources,
+        min_snr=args.min_snr,
+        sigma_threshold=args.sigma_threshold,
+        verbose=True,
+    )
