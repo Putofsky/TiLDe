@@ -34,6 +34,9 @@ data/*
 !data/README.md
 datasets/
 
+results/*
+
+
 # Temporary logs
 logs/
 *.log
