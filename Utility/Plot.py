@@ -1,3 +1,10 @@
+"""Visual diagnostics for Gaia lens-system light curves.
+
+The public plotting functions accept a CSV path, DataFrame or nested component
+dictionary.  Smoothing and Gaussian-process curves are display aids only; they
+do not alter the scientific input table.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

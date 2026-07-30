@@ -1,70 +1,110 @@
-
 # TiLDe
 
-**TiLDe** is a project designed to detect gravitational lensing candidates using light curves.
+**TiLDe** is a reproducible Python project for detecting quasar and
+gravitational-lens candidates in Gaia light curves, then estimating
+inter-component time delays.
 
-The tools in this repository are specifically adapted to **Gaia time-series data**. Results may not generalize well to other types of light-curve datasets without additional tuning or validation.
+The repository is organised for scientific handoff: research algorithms live
+in importable `.py` modules, each module has a guided notebook, all time-delay
+parameters are stored in named profiles, and the original research notebooks
+remain available under `notebooks/legacy/`.
 
-## Features
-
-- Data-cleaning scripts
-- Quasar candidate detection models
-- Lens candidate detection models
-- Explanatory resources and documentation
-
-## Data-Cleaning Step
-
-Data cleaning is a crucial part of the pipeline because all classifications are based on time-series measurements.
-
-The goal is to determine, as accurately as possible, whether each measurement is relevant. This is done by using prior knowledge about the Gaia data and by exploiting information contained in nearby or related measurements.
-
-## Workflow
-
-The first step is to identify quasar-like light curves. Once quasar candidates are selected, close quasar pairs can be tested to detect correlated light variations.
-
-The lens-detection step is designed to be invariant, as much as possible, to:
-
-- Time delays
-- Microlensing effects
-- Noise
+## Pipeline
 
 ```mermaid
 flowchart LR
-    A[Clean Data] --> B[Predict Quasars]
-    B --> C[Quasar Candidates]
-    C --> D[Build Quasar Pairs]
-    D --> E[Predict Lens Candidates]
+    A["Raw Gaia light curves"] --> B["Preprocessing"]
+    B --> C["Quasar classification"]
+    C --> D["Component pairing"]
+    D --> E["Lens classification"]
+    E --> F["Time-delay estimation"]
 ```
 
-## Quasar Prediction
+| Stage | Python module | Guided notebook |
+|---|---|---|
+| Component grouping | `Utility/IdSep.py` | `notebooks/01_component_grouping.ipynb` |
+| Cleaning and filtering | `Utility/Pretraitement.py` | `notebooks/02_preprocessing.ipynb` |
+| Light-curve visualisation | `Utility/Plot.py` | `notebooks/03_visualisation.ipynb` |
+| Quasar inference (RF + EDSM) | `Utility/Inference.py` | `notebooks/04_quasar_inference.ipynb` |
+| Lens-pair random forest | `Utility/RF.py` | `notebooks/05_lens_random_forest.ipynb` |
+| Lens-pair neural network | `Utility/LensNN.py` | `notebooks/06_lens_neural_network.ipynb` |
+| Linear-interpolation delay | `Utility/time_delay_interpolation.py` | `notebooks/07_time_delay_interpolation.ipynb` |
+| Adaptive P-spline delay | `Utility/time_delay_pspline.py` | `notebooks/08_time_delay_pspline.ipynb` |
+| Package/import check | `Utility/__init__.py` | `notebooks/00_start_here.ipynb` |
+| Synthetic smoke tests | `tests/smoke_test.py` | `notebooks/00_start_here.ipynb` |
 
-The goal of this step is to remove as many stars as possible from the dataset.
+## Start here
 
-Two models are trained:
+1. Follow [Windows and macOS installation](docs/INSTALLATION.md).
+2. Read the [data contract](docs/DATA_FORMAT.md).
+3. Open `notebooks/00_start_here.ipynb`.
+4. Copy your CSV files into `data/` without changing the supplied model files.
+5. Run the guided notebooks in numerical order.
 
-1. A neural network model
-2. A random forest model with feature engineering
+The `data/` directory is intentionally empty because the research Gaia tables
+are not redistributed in this archive. Each notebook checks its expected input
+path before running and explains which file must be supplied.
 
-The combination of both models may produce more false positives, but it significantly reduces false negatives, which is preferred at this stage of the pipeline.
+## Time-delay command line
 
-```mermaid
-flowchart LR
-    A[Clean Data] --> B[Neural Network]
-    A --> C[Random Forest + Feature Engineering]
-    B --> D[Predict Quasar Candidates]
-    C --> D
+Classical interpolation:
+
+```bash
+python -m Utility.time_delay_interpolation data/cleaned_lightcurves.csv \
+  --source-id 3361094865862486656 \
+  --component-a 3361094865862486721 \
+  --component-b 3361094865862486723 \
+  --profile standard \
+  --mc-samples 300
 ```
 
-## Lens Prediction
+Adaptive P-spline:
 
-After quasar candidates are selected, they are paired and passed through lens-detection models.
-
-As in the quasar-prediction step, the pipeline combines a neural network approach with a random forest model using engineered features.
-
-```mermaid
-flowchart LR
-    A[Quasar Pair] --> B[Neural Network]
-    A --> C[Random Forest + Feature Engineering]
-    B --> D[Predict Lens Candidate]
-    C --> D
+```bash
+python -m Utility.time_delay_pspline data/cleaned_lightcurves.csv \
+  --source-id 5915407711751697280 \
+  --components 5915407711751697345 5915407711751697347 \
+  --names "A reference" B \
+  --profile standard \
+  --mc-samples 300
 ```
+
+Batch P-spline run:
+
+```bash
+python -m Utility.time_delay_pspline data/cleaned_lightcurves.csv \
+  --pairs configs/time_delay_system_pairs.csv \
+  --profile legacy_notebook \
+  --mc-samples 300 \
+  --output-dir results/batch_time_delays
+```
+
+Run `python -m Utility.time_delay_interpolation --help` or
+`python -m Utility.time_delay_pspline --help` for every option.
+
+## Reproducibility
+
+- `configs/time_delay_profiles.json` preserves quick, standard, original
+  notebook and high-precision parameter adaptations.
+- Gaia identifiers are loaded and exported as strings to prevent precision
+  loss in spreadsheet software.
+- Monte Carlo uncertainty draws use explicit random seeds.
+- Batch results are checkpointed after every system.
+- Existing trained models are kept in `models/`; their purpose and inputs are
+  documented in `Models-Documentation/`.
+
+## Documentation
+
+- [Installation](docs/INSTALLATION.md)
+- [Data format](docs/DATA_FORMAT.md)
+- [Complete workflows](docs/WORKFLOWS.md)
+- [Time-delay methodology](docs/TIME_DELAY_METHODS.md)
+- [Supervisor handoff and troubleshooting](docs/SUPERVISOR_HANDOFF.md)
+- [Change log](CHANGELOG.md)
+
+## Scope
+
+The preprocessing choices and trained models are adapted to Gaia epoch
+photometry. Applying them to another survey requires validation, recalibration
+and potentially retraining. Candidate probabilities and time delays are
+scientific decision-support outputs, not automatic confirmations of a lens.

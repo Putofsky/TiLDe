@@ -1,0 +1,9 @@
+-r requirements-core.txt
+
+# Optional ML inference dependencies required by Inference.py and LensNN.py.
+torch>=2.5,<3
+sktime>=0.38,<1
+
+# Interactive supervisor notebooks.
+jupyterlab>=4,<5
+ipykernel>=6,<8

@@ -926,9 +926,19 @@ def run_edsm_inference(
 
 def resolve_device(requested: str) -> torch.device:
     if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA demandé, mais aucun GPU CUDA n'est disponible.")
+    if requested == "mps" and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ):
+        raise RuntimeError(
+            "MPS demandé, mais aucun GPU Apple Metal compatible n'est disponible."
+        )
     return torch.device(requested)
 
 
@@ -1147,7 +1157,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
     parser.add_argument("--seed", type=int, default=42)
