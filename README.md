@@ -5,9 +5,7 @@ gravitational-lens candidates in Gaia light curves, then estimating
 inter-component time delays.
 
 The repository is organised for scientific handoff: research algorithms live
-in importable `.py` modules, each module has a guided notebook, all time-delay
-parameters are stored in named profiles, and the original research notebooks
-remain available under `notebooks/legacy/`.
+in importable `.py` modules, each module has a guided notebook.
 
 ## Pipeline
 
@@ -19,6 +17,55 @@ flowchart LR
     D --> E["Lens classification"]
     E --> F["Time-delay estimation"]
 ```
+
+### Competitive Quasar Classification Using Light-Curve Variability
+
+TiLDe provides two complementary quasar-versus-star classifiers that rely exclusively on light-curve variability. They do not use colours, spectra, astrometry, or source morphology:
+
+* a Random Forest trained on Catch22 time-series features;
+* EDSM-Lite, a lightweight neural network designed for irregularly sampled light curves.
+
+On the held-out test set, the models achieve the following results:
+
+| Model                   | Accuracy | Balanced accuracy | ROC-AUC |
+| ----------------------- | -------: | ----------------: | ------: |
+| Random Forest + Catch22 |   95.75% |            95.79% |  0.9928 |
+| EDSM-Lite               |   93.61% |            92.45% |  0.9816 |
+
+These results are competitive with published variability-based quasar classifiers. For example, Yang et al. (2021) report approximately 98.5% precision and 97.5% completeness using variability features extracted from SDSS Stripe 82 light curves. However, the results are not directly comparable: the surveys have different cadences, photometric uncertainties, selection functions, class distributions, and preprocessing procedures. Yang et al. also show that their approach remains effective when restricted to one or two years of observations, so the difference in temporal baseline alone cannot establish superiority.
+
+Gaia light curves are particularly challenging because they are sparse, irregularly sampled, and frequently contain relatively few usable observations. In this context, the TiLDe results demonstrate that quasar variability remains highly discriminative even without colours or spectra.
+
+On the external real-data application sample used in this project, both models recover or agree with approximately 94% of the available quasar reference labels. This value should be interpreted as an external recovery or agreement rate rather than a full accuracy estimate when exhaustive positive and negative ground-truth labels are unavailable. As a comparison, the Gaia GLEAN catalogue reports an expected purity above 95%, but a completeness of only approximately 47–51% when evaluated against external AGN catalogues.
+
+These models remain open to improvement. The provided dataset generator can be used to construct controlled experiments, reproduce Gaia-like cadences and noise levels, and evaluate new architectures under known simulation parameters.
+
+### Latent Cross-Correlation Classifier for Gravitationally Lensed Quasars
+
+TiLDe also provides a neural network for classifying pairs of light curves as compatible or incompatible with gravitational lensing. The model uses a shared temporal encoder followed by a latent cross-correlation module evaluated over a grid of candidate delays. It jointly learns:
+
+* a lens-compatibility score;
+* a latent correlation map;
+* an estimated time delay between the two components.
+
+On the current held-out synthetic benchmark, the network achieves approximately 75% lens-classification accuracy. On the selected high-quality real-data evaluation subset, it reaches a reported precision of approximately 82%. This second result is conditional on the quality cuts, decision threshold, and construction of the evaluation sample; it should not be extrapolated to the complete Gaia candidate population.
+
+The model should therefore be regarded as an exploratory and potentially novel application of learned latent cross-correlation, rather than as an established state-of-the-art lens classifier. Previous studies have already used temporal information to identify lensed quasars. Shu et al. (2021), for example, use autocorrelation features from unresolved light curves and obtain effective true-positive rates of 28–58% for doubles and 36–60% for quads while maintaining a false-positive rate below approximately 10%. Bag et al. (2022) report precision close to 100% and recall around 60% in simulations with ZTF-like noise. These methods address unresolved light curves and are therefore not directly equivalent to the resolved pair-classification problem considered by TiLDe.
+
+The accompanying Random Forest lens classifier is retained as an interpretable classical baseline. It is currently less accurate and slower than the latent-correlation network on the project benchmarks. Consequently, the neural model is the recommended option for large-scale inference, while the Random Forest remains useful for feature analysis, diagnostic comparisons, and independent model validation.
+
+The models and synthetic-pair generator are intentionally provided as extensible research components.
+
+### References
+
+1. Yang, D.-M., Xie, Z.-L., & Wang, J.-X. (2021). [*The feasibility and flexibility of selecting quasars by variability using ensemble machine learning algorithms*](https://doi.org/10.1088/1674-4527/21/4/99). Research in Astronomy and Astrophysics, 21, 99.
+
+2. Carnerero, M. I., et al. (2023). [*Gaia Data Release 3: The first Gaia catalogue of variable AGN*](https://doi.org/10.1051/0004-6361/202244035). Astronomy & Astrophysics, 674, A24.
+
+3. Shu, Y., Belokurov, V., & Evans, N. W. (2021). [*Discovering strongly lensed QSOs from unresolved light curves*](https://doi.org/10.1093/mnras/stab241). Monthly Notices of the Royal Astronomical Society, 502, 2912–2921.
+
+4. Bag, S., Shafieloo, A., Liao, K., & Treu, T. (2022). [*Identifying lensed quasars and measuring their time delays from unresolved light curves*](https://doi.org/10.3847/1538-4357/ac51cb). The Astrophysical Journal, 927, 191.
+
 
 | Stage | Python module | Guided notebook |
 |---|---|---|
