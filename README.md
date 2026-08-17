@@ -146,7 +146,6 @@ Run `python -m Utility.time_delay_interpolation --help` or
 - [Data format](docs/DATA_FORMAT.md)
 - [Complete workflows](docs/WORKFLOWS.md)
 - [Time-delay methodology](docs/TIME_DELAY_METHODS.md)
-- [Supervisor handoff and troubleshooting](docs/SUPERVISOR_HANDOFF.md)
 - [Change log](CHANGELOG.md)
 
 ## Scope
