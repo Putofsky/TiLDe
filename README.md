@@ -108,3 +108,11 @@ The preprocessing choices and trained models are adapted to Gaia epoch
 photometry. Applying them to another survey requires validation, recalibration
 and potentially retraining. Candidate probabilities and time delays are
 scientific decision-support outputs, not automatic confirmations of a lens.
+
+## Improovements
+
+The time-delay component was developed under significant time constraints and leaves considerable room for improvement. First, the methodology should be validated more thoroughly using synthetic light curves with known time delays. The time-dependent regularization of the penalized spline could also be improved: the current rolling-MAD approach is relatively simple, whereas more advanced methods for locally adaptive smoothing exist in the literature.
+
+The Monte Carlo procedure currently assumes Gaussian photometric errors when perturbing the observed fluxes. This assumption may not accurately represent real measurement errors. More importantly, even when the observational errors are Gaussian, the resulting distribution of estimated time delays does not have to be Gaussian. Because the inference problem is ill-posed, several competing solutions may exist, producing a multimodal distribution.
+
+In such cases, uncertainty should be estimated separately around each mode. Global statistics such as the mean or median and the 16th to 84th percentile interval can be misleading, particularly when they fall between distinct modes. However, reliably determining which peaks represent genuine modes, assigning individual estimates to those modes, and identifying the physically correct solution are difficult problems. A robust solution may involve stochastic sampling, density estimation, clustering, or Bayesian model comparison. Developing and validating such an approach is left for future work.
