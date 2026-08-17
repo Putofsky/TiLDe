@@ -75,17 +75,3 @@ sampler on the delay. `force_same_K_as_base=True` keeps the spline size selected
 on the original data, substantially reducing computation while isolating the
 effect of photometric error. Set it to `False` when uncertainty in model
 complexity must also be propagated.
-
-## Parameter profiles
-
-`configs/time_delay_profiles.json` contains:
-
-| Profile | Use |
-|---|---|
-| `quick` | Path/ID/overlap smoke test. |
-| `standard` | Recommended scientific workflow. |
-| `legacy_notebook` | Exact original notebook settings. |
-| `high_precision` | Dense final scan for a small validated sample. |
-
-All values may still be copied into a notebook dictionary and adjusted for a
-specific cadence, delay range or overlap.
